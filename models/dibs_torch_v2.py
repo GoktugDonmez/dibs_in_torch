@@ -20,14 +20,7 @@ def acyclic_constr(g_mat, d):
     # if d is small, torch.linalg.matrix_power is fine.
     # For larger d, this can be computationally intensive.
     # The original DiBS paper uses d in the exponent.
-    try:
-        m_mult = torch.linalg.matrix_power(m, d)
-    except Exception as e:
-        # Fallback for potential issues with matrix_power if d is too large or matrix is ill-conditioned
-        # This is a placeholder; a robust solution might involve iterative multiplication
-        # or checking matrix properties. For now, we'll re-raise or return a large penalty.
-        print(f"Warning: torch.linalg.matrix_power failed with d={d}. Error: {e}. Returning large penalty.")
-        return torch.tensor(float('inf'), device=g_mat.device, dtype=g_mat.dtype)
+    m_mult = torch.linalg.matrix_power(m, d)
 
 
     h = torch.trace(m_mult) - d
@@ -798,7 +791,7 @@ def update_dibs_hparams(hparams_dict, t_step):
     # This factor decreases then increases. For annealing, we usually want monotonic increase/decrease.
     # Example: linear annealing or exponential decay/increase.
     # If t_step is iter_num + 1:
-    annealing_factor = 1.0 # Default, no annealing
+    factor = 1.0 # Default, no annealing
     if t_step > 0: # Basic check
         # A common annealing schedule is to increase beta, tau, alpha over time.
         # Let's use a simple linear increase for demonstration, or keep JAX's if intended.

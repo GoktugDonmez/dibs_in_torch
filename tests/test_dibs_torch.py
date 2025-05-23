@@ -209,9 +209,10 @@ def test_log_gaussian_likelihood():
     log_lik = log_gaussian_likelihood(x, pred_mean, sigma)
     # Manual calculation for N(1.0; 1.1, 0.5^2) + N(2.0; 2.2, 0.5^2)
     # logpdf(x, mu, sigma) = -0.5 * ((x-mu)/sigma)**2 - log(sigma * sqrt(2*pi))
-    term1 = -0.5 * ((1.0-1.1)/0.5)**2 - math.log(0.5 * math.sqrt(2*math.pi)) # -0.02 - (-0.2047) = -0.02 + 0.2047 = 0.1847
-    term2 = -0.5 * ((2.0-2.2)/0.5)**2 - math.log(0.5 * math.sqrt(2*math.pi)) # -0.08 - (-0.2047) = -0.08 + 0.2047 = 0.1247
-    expected = term1 + term2 # approx 0.3094
+    term1 = -0.5 * ((1.0-1.1)/0.5)**2 - math.log(0.5 * math.sqrt(2*math.pi)) 
+    term2 = -0.5 * ((2.0-2.2)/0.5)**2 - math.log(0.5 * math.sqrt(2*math.pi))
+    print(f"  term1: {term1}, term2: {term2}")
+    expected = term1 + term2
     print(f"  Computed log_lik: {log_lik.item()}, Expected approx: {expected}")
     assert math.isclose(log_lik.item(), expected, rel_tol=1e-4)
     print("  log_gaussian_likelihood() test passed.")
@@ -250,6 +251,104 @@ def test_log_full_likelihood():
     print(f"  log_full_likelihood output: {log_full_lik.item()}")
     assert isinstance(log_full_lik.item(), float) # Check it's a scalar float
     print("  log_full_likelihood() test passed (ran without error).")
+
+def test_log_full_likelihood_exact_value():
+    """
+    Tests the log_full_likelihood function by manually calculating its components
+    and comparing against the function's output.
+    """
+    print("\nTesting log_full_likelihood_exact_value()...")
+    d_test = 2
+    n_samples_test = 5
+    # n_expert_edges_test = 1 # This is implicitly handled by data_dict construction
+    data_seed = 3
+    theta_seed = 4
+
+    # --- 1. Generate Inputs ---
+    torch.manual_seed(data_seed) 
+    x_data = torch.randn(n_samples_test, d_test)
+    
+    # To make the expert value deterministic for this test, we re-seed *just before* generating it.
+    # This ensures that 'expert_val_tensor' is the same each time this test runs.
+    torch.manual_seed(data_seed) 
+    expert_val_tensor = torch.tensor(float(torch.randint(0, 2, (1,)).item())) 
+    
+    data_dict = {
+        'x': x_data,
+        'y': [torch.tensor([0.0, 1.0, expert_val_tensor.item()], dtype=torch.float32)] # Edge (0,1)
+    }
+
+    torch.manual_seed(theta_seed)
+    current_theta_test = torch.randn(d_test, d_test)
+
+    soft_gmat_test = torch.tensor([[0.0, 0.8], [0.1, 0.0]], dtype=torch.float32)
+    
+    sigma_obs_noise_val_test = 0.2
+    rho_val_test = 0.1
+    temp_ratio_val_test = 0.5
+    
+    hparams_test = {
+        'sigma_obs_noise': sigma_obs_noise_val_test,
+        'rho': rho_val_test,
+        'temp_ratio': temp_ratio_val_test,
+        'alpha': 1.0, 
+        'd': d_test
+    }
+    device_test = 'cpu'
+
+    # --- 2. Call the function under test ---
+    actual_log_full_lik_output = log_full_likelihood(data_dict, soft_gmat_test, current_theta_test, hparams_test, device=device_test).item()
+
+    # --- 3. Manually Calculate Expected Log Likelihood ---
+    expected_log_lik_manual = 0.0
+
+    # --- 3a. Observational Likelihood Part ---
+    effective_W = current_theta_test * soft_gmat_test
+    pred_mean_manual = torch.matmul(data_dict['x'], effective_W)
+    
+    manual_log_obs_likelihood = 0.0
+    for n_idx in range(n_samples_test):
+        for d_idx_loop in range(d_test): # Renamed to avoid conflict with hparams['d']
+            x_val = data_dict['x'][n_idx, d_idx_loop].item()
+            mu_val = pred_mean_manual[n_idx, d_idx_loop].item()
+            term_val = -0.5 * ((x_val - mu_val) / sigma_obs_noise_val_test)**2
+            term_const = math.log(sigma_obs_noise_val_test * math.sqrt(2 * math.pi))
+            manual_log_obs_likelihood += (term_val - term_const)
+    expected_log_lik_manual += manual_log_obs_likelihood
+
+    # --- 3b. Expert Likelihood Part ---
+    manual_log_expert_likelihood_total = 0.0
+    inv_temperature_expert = hparams_test.get("temp_ratio", 0.0)
+    # Use the default jitter from log_bernoulli_likelihood if not passed, which is 1e-5
+    jitter_manual = 1e-5 
+
+    if data_dict.get("y", None) is not None and len(data_dict["y"]) > 0:
+        for expert_belief in data_dict["y"]:
+            i, j, val = int(expert_belief[0].item()), int(expert_belief[1].item()), expert_belief[2].item()
+            g_ij_prob = soft_gmat_test[i, j].item()
+            rho = hparams_test["rho"]
+            
+            prob_expert_says_1 = g_ij_prob * (1.0 - rho) + (1.0 - g_ij_prob) * rho
+            prob_expert_says_0 = g_ij_prob * rho + (1.0 - g_ij_prob) * (1.0 - rho)
+
+            log_lik_single_expert = 0.0
+            if math.isclose(val, 1.0):
+                log_lik_single_expert = math.log(prob_expert_says_1 + jitter_manual)
+            else: 
+                log_lik_single_expert = math.log(prob_expert_says_0 + jitter_manual)
+            manual_log_expert_likelihood_total += log_lik_single_expert
+            
+    expected_log_lik_manual += (inv_temperature_expert * manual_log_expert_likelihood_total)
+
+    # --- 4. Compare ---
+    print(f"  Manually calculated expected log_lik: {expected_log_lik_manual}")
+    print(f"  Function output log_lik: {actual_log_full_lik_output}")
+
+    assert math.isclose(actual_log_full_lik_output, expected_log_lik_manual, rel_tol=1e-4), \
+        f"Mismatch: Actual {actual_log_full_lik_output}, Expected {expected_log_lik_manual}"
+    print("  log_full_likelihood_exact_value() test passed.")
+
+
 
 def test_log_theta_prior():
     print("\nTesting log_theta_prior()...")
@@ -372,6 +471,331 @@ def test_update_dibs_hparams():
     print("  update_dibs_hparams() test passed.")
 
 
+## TEST FOR SINGLE PARTICLE GRADIENT ASCENT
+
+def run_single_particle_gradient_ascent_test():
+    print("\n--- Running Single Particle Gradient Ascent Test ---")
+    D_nodes = 3
+    K_latent = 2
+    N_samples_data = 20
+    N_expert_edges_data = 1 # Can set to 0 to test without expert data
+
+    # Initial particle ( Z_current and Theta_current will be updated in-place)
+    torch.manual_seed(200) # Seed for initial Z and Theta
+    Z_current = create_dummy_z(D_nodes, K_latent, requires_grad=False)
+    Theta_current = create_dummy_theta(D_nodes, requires_grad=False)
+
+    # Data
+    torch.manual_seed(201) # Seed for data generation
+    data_dict = create_dummy_data(N_samples_data, D_nodes, N_expert_edges_data)
+
+    # Base Hyperparameters (these will be passed to grad_log_joint, which handles annealing)
+    # Ensure 'alpha_base', 'beta_base', 'tau_base' are present if update_dibs_hparams uses them.
+    base_hparams_config = create_dummy_hparams(
+        d=D_nodes,
+        alpha_val=0.1,  # Starting alpha for annealing (via alpha_base)
+        beta_val=0.1,   # Starting beta for annealing (via beta_base)
+        tau_val=1.0,    # Starting tau for annealing (via tau_base)
+        sigma_z_val=1.0,
+        sigma_obs_noise_val=0.3,
+        rho_val=0.1,
+        temp_ratio_val=1.0, # Weight for expert likelihood
+        n_grad_mc_samples_val=5, # Number of MC samples for likelihood part of gradient
+        n_nongrad_mc_samples_val=5, # Number of MC samples for acyclicity part of gradient
+        theta_prior_sigma_val=1.0
+    )
+
+    lr_z = 0.005
+    lr_theta = 0.005
+    num_iterations = 50 # Keep low for a quick test
+
+    print(f"Initial Z (norm): {Z_current.norm().item():.4f}")
+    print(f"Initial Theta (norm): {Theta_current.norm().item():.4f}")
+    if data_dict['y']:
+        print(f"Expert data: {data_dict['y']}")
+    else:
+        print("No expert data provided for this run.")
+
+
+    for t_iter in range(num_iterations):
+        # Annealing step 't' for grad_log_joint and log_joint.
+        # Typically, t = iteration_number + 1 for annealing schedules like (t + 1/t)
+        current_annealing_t_for_hparams = torch.tensor(float(t_iter + 1))
+
+        # Prepare Z and Theta to allow gradients to be computed w.r.t. them for this step
+        Z_param = Z_current.clone().detach().requires_grad_(True)
+        Theta_param = Theta_current.clone().detach().requires_grad_(True)
+
+        params_for_calc = {'z': Z_param, 'theta': Theta_param, 't': current_annealing_t_for_hparams}
+
+        # 1. (Optional but recommended) Calculate and print current log-joint probability
+        #    log_joint will use params_for_calc['t'] to get annealed hparams via update_dibs_hparams
+        try:
+            lj = log_joint(params_for_calc, data_dict, base_hparams_config, device='cpu')
+            lj_val = lj.item()
+        except Exception as e:
+            print(f"Error computing log_joint at iter {t_iter+1}: {e}")
+            lj_val = float('nan')
+
+
+        # 2. Calculate gradients using the DiBS model's grad_log_joint
+        #    grad_log_joint will use params_for_calc['t'] to get annealed hparams
+        try:
+            grads = grad_log_joint(params_for_calc, data_dict, base_hparams_config, device='cpu')
+            grad_z = grads['z']
+            grad_theta = grads['theta']
+            grad_z_norm = grad_z.norm().item()
+            grad_theta_norm = grad_theta.norm().item()
+        except Exception as e:
+            print(f"Error computing gradients at iter {t_iter+1}: {e}")
+            # If gradient computation fails, break or handle appropriately
+            grad_z_norm = float('nan')
+            grad_theta_norm = float('nan')
+            break # Stop if gradients fail
+
+        # 3. Perform gradient ascent update on Z_current and Theta_current
+        with torch.no_grad(): # Ensure updates are not tracked by autograd
+            Z_current.add_(lr_z * grad_z) # In-place update
+            Theta_current.add_(lr_theta * grad_theta) # In-place update
+
+        if (t_iter + 1) % 5 == 0 or t_iter == 0:
+            print(f"Iter {t_iter+1:3d}: Z_norm={Z_current.norm().item():.4f}, Theta_norm={Theta_current.norm().item():.4f}, "
+                  f"log_joint={lj_val:.4f}, grad_Z_norm={grad_z_norm:.4e}, grad_Theta_norm={grad_theta_norm:.4e}")
+
+            # Optionally print annealed hparams to check annealing
+            current_hparams_for_iter = update_dibs_hparams(base_hparams_config, current_annealing_t_for_hparams.item())
+            print(f"    Annealed alpha: {current_hparams_for_iter['alpha']:.4f}, beta: {current_hparams_for_iter['beta']:.4f}, tau: {current_hparams_for_iter['tau']:.4f}")
+
+            # Basic check for NaNs in parameters (could indicate instability)
+            if torch.isnan(Z_current).any() or torch.isnan(Theta_current).any():
+                print("!!! NaN detected in parameters. Stopping. !!!")
+                break
+            if torch.isinf(Z_current).any() or torch.isinf(Theta_current).any():
+                print("!!! Inf detected in parameters. Stopping. !!!")
+                break
+    
+    print("\n--- Single Particle Gradient Ascent Test Completed ---")
+    print(f"Final Z (norm): {Z_current.norm().item():.4f}")
+    print(f"Final Theta (norm): {Theta_current.norm().item():.4f}")
+    print(f"Final Z: {Z_current}")
+    print(f"Final Theta: {Theta_current}")
+
+    # Optional: Convert final Z to a hard graph to see what was learned
+    # Need hard_gmat_particles_from_z and a final set of hparams for it
+    final_t_for_hparams = torch.tensor(float(num_iterations)) # or num_iterations + 1
+    final_hparams = update_dibs_hparams(base_hparams_config, final_t_for_hparams.item())
+    if 'hard_gmat_particles_from_z' in globals(): # Check if function is defined
+        try:
+            # hard_gmat_particles_from_z might expect a batch of Z particles
+            final_hard_g = hard_gmat_particles_from_z(Z_current.unsqueeze(0),
+                                                  alpha_hparam_for_scores=final_hparams.get('alpha', 1.0))
+            print(f"Final hard graph from Z_current (alpha={final_hparams.get('alpha', 1.0):.2f}):\n{final_hard_g.squeeze(0).int()}")
+        except Exception as e:
+            print(f"Could not generate final hard graph: {e}")
+    else:
+        print("hard_gmat_particles_from_z function not found for final graph display.")
+
+## TEST WITH GROUND TRUTH DATA SYNTHETIC DATA
+
+# --- Synthetic Data Generation for Ground Truth Testing ---
+def generate_linear_gaussian_data(G_true, Theta_true, num_samples, obs_noise_std, seed=None):
+    """
+    Generates data from a linear Gaussian BN.
+    Assumes G_true is a DAG and nodes can be generated in topological order (0, 1, ..., D-1).
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+    
+    D = G_true.shape[0]
+    X_data = torch.zeros(num_samples, D)
+    
+    # Generate data column by column (node by node)
+    for j in range(D): # For each node j
+        mean_j = torch.zeros(num_samples)
+        for i in range(D): # For each potential parent i
+            if G_true[i, j] == 1: # If i is a parent of j
+                mean_j += X_data[:, i] * Theta_true[i, j]
+        
+        # Add exogenous noise for root nodes (those with no parents in G_true)
+        # or if mean_j is still zero (can happen if all parent coeffs are zero, though unlikely for true roots)
+        is_root_node = (torch.sum(G_true[:, j]) == 0)
+        if is_root_node:
+             # For root nodes, the "mean" is effectively 0 before adding noise.
+             # Their variance is determined by obs_noise_std^2 if we model X_j = N(0, obs_noise_std^2)
+             # Or, they can have their own exogenous noise std. For simplicity:
+             X_data[:, j] = torch.randn(num_samples) * obs_noise_std # Base noise for root nodes
+        else:
+            X_data[:, j] = mean_j + torch.randn(num_samples) * obs_noise_std
+            
+    return {'x': X_data, 'y': None} # 'y' is None as we are not generating expert data here
+
+
+def run_single_particle_gradient_ascent_test_with_ground_truth():
+    print("\n--- Running Single Particle Gradient Ascent Test with Ground Truth ---")
+    
+    # 1. Define Ground Truth BN (X0 -> X1 -> X2)
+    D_nodes = 3
+    G_true = torch.tensor([
+        [0., 1., 0.],  # X0 -> X1
+        [0., 0., 1.],  # X1 -> X2
+        [0., 0., 0.]
+    ], dtype=torch.float32)
+
+    Theta_true = torch.tensor([
+        [0., 2.0, 0.],  # Coeff for X0->X1 is 2.0
+        [0., 0., -1.5], # Coeff for X1->X2 is -1.5
+        [0., 0., 0.]
+    ], dtype=torch.float32)
+    
+    synthetic_obs_noise_std = 0.1 # Noise in the synthetic data generation
+    N_synthetic_samples = 200   # Number of data points to generate
+
+    print("Ground Truth Model:")
+    print(f"G_true:\n{G_true.int()}")
+    print(f"Theta_true:\n{Theta_true}")
+    print(f"Synthetic data observation noise_std: {synthetic_obs_noise_std}")
+    print(f"Number of synthetic samples: {N_synthetic_samples}")
+
+    # 2. Generate Data from Ground Truth
+    torch.manual_seed(301) # For reproducibility of data generation
+    data_dict = generate_linear_gaussian_data(G_true, Theta_true, N_synthetic_samples, synthetic_obs_noise_std)
+    print(f"Generated data X shape: {data_dict['x'].shape}")
+
+    # 3. Initialize Particle (Z and Theta)
+    K_latent = D_nodes # A common choice, or smaller e.g., 2
+    torch.manual_seed(302) # For reproducibility of particle initialization
+    Z_current = create_dummy_z(D_nodes, K_latent, requires_grad=False)
+    Theta_current = create_dummy_theta(D_nodes, requires_grad=False) # Will be random initially
+
+    # 4. Base Hyperparameters for DiBS
+    # Note: sigma_obs_noise_val in hparams is what the *model assumes* during learning.
+    # It might be the same as synthetic_obs_noise_std or different if testing robustness.
+    base_hparams_config = create_dummy_hparams(
+        d=D_nodes,
+        alpha_val=0.1,
+        beta_val=0.1,
+        tau_val=1.0,
+        sigma_z_val=1.0,
+        sigma_obs_noise_val=synthetic_obs_noise_std, # Model assumes same noise as data generation
+        rho_val=0.05, # Not used if data_dict['y'] is None
+        temp_ratio_val=0.0, # No expert data, so this won't have effect
+        n_grad_mc_samples_val=10, # More MC samples for better gradient estimates
+        n_nongrad_mc_samples_val=10,
+        theta_prior_sigma_val=0.5 # Prior on learned Theta_eff
+    )
+
+    lr_z = 0.001
+    lr_theta = 0.001
+    num_iterations = 15 # Increase for a better chance to learn
+
+    print(f"\nInitial Z (norm): {Z_current.norm().item():.4f}")
+    print(f"Initial Theta (norm): {Theta_current.norm().item():.4f}")
+    print(f"Initial Theta values:\n{Theta_current}")
+
+
+    for t_iter in range(num_iterations):
+        current_annealing_t_for_hparams = torch.tensor(float(t_iter + 1))
+        Z_param = Z_current.clone().detach().requires_grad_(True)
+        Theta_param = Theta_current.clone().detach().requires_grad_(True)
+        params_for_calc = {'z': Z_param, 'theta': Theta_param, 't': current_annealing_t_for_hparams}
+
+        try:
+            lj = log_joint(params_for_calc, data_dict, base_hparams_config, device='cpu')
+            lj_val = lj.item()
+        except Exception as e:
+            print(f"Error computing log_joint at iter {t_iter+1}: {e}")
+            lj_val = float('nan')
+
+        try:
+            grads = grad_log_joint(params_for_calc, data_dict, base_hparams_config, device='cpu')
+            grad_z = grads['z']
+            grad_theta = grads['theta']
+            grad_z_norm = grad_z.norm().item()
+            grad_theta_norm = grad_theta.norm().item()
+        except Exception as e:
+            print(f"Error computing gradients at iter {t_iter+1}: {e}")
+            grad_z_norm = float('nan'); grad_theta_norm = float('nan')
+            break 
+
+        with torch.no_grad():
+            Z_current.add_(lr_z * grad_z)
+            Theta_current.add_(lr_theta * grad_theta)
+
+        if (t_iter + 1) % 20 == 0 or t_iter == 0: # Print more frequently initially, then less
+            print(f"Iter {t_iter+1:3d}: Z_norm={Z_current.norm().item():.4f}, Theta_norm={Theta_current.norm().item():.4f}, "
+                  f"log_joint={lj_val:.4f}, grad_Z_norm={grad_z_norm:.4e}, grad_Theta_norm={grad_theta_norm:.4e}")
+            current_hparams_for_iter = update_dibs_hparams(base_hparams_config, current_annealing_t_for_hparams.item())
+            print(f"    Annealed alpha: {current_hparams_for_iter['alpha']:.4f}, beta: {current_hparams_for_iter['beta']:.4f}")
+            
+            # Print current edge probabilities from Z_current
+            hparams_for_edge_probs = {'alpha': current_hparams_for_iter['alpha'], 'd': D_nodes}
+            with torch.no_grad():
+                current_edge_probs = bernoulli_soft_gmat(Z_current, hparams_for_edge_probs)
+            print(f"    Current Edge Probs (from Z_current with current alpha):\n{current_edge_probs.round(decimals=3)}")
+
+
+            if torch.isnan(Z_current).any() or torch.isnan(Theta_current).any() or \
+               torch.isinf(Z_current).any() or torch.isinf(Theta_current).any():
+                print("!!! NaN/Inf detected in parameters. Stopping. !!!")
+                break
+    
+    print("\n--- Single Particle Gradient Ascent (Ground Truth Data) Completed ---")
+    print(f"Final Z (norm): {Z_current.norm().item():.4f}")
+    print(f"Final Theta (norm): {Theta_current.norm().item():.4f}")
+
+    # 5. Compare Learned Graph and Parameters to Ground Truth
+    final_t_for_hparams = torch.tensor(float(num_iterations))
+    final_hparams = update_dibs_hparams(base_hparams_config, final_t_for_hparams.item())
+    
+    G_learned_hard = torch.zeros_like(G_true) # Default to zeros
+    if 'hard_gmat_particles_from_z' in globals():
+        try:
+            G_learned_hard = hard_gmat_particles_from_z(
+                Z_current.unsqueeze(0), # Expects batch
+                alpha_hparam_for_scores=final_hparams.get('alpha', 1.0)
+            ).squeeze(0).int()
+        except Exception as e:
+            print(f"Could not generate final hard graph: {e}. Using zeros.")
+    else:
+        print("hard_gmat_particles_from_z function not found. Using zeros for G_learned_hard.")
+
+
+    print("\n--- Comparison with Ground Truth ---")
+    print(f"G_true:\n{G_true.int()}")
+    print(f"G_learned_hard (alpha={final_hparams.get('alpha', 1.0):.2f}):\n{G_learned_hard}")
+
+    # Structural Hamming Distance (SHD) - a proper implementation would be better
+    # This is a simplified version: count differences in adjacency matrices
+    adj_diff = G_learned_hard != G_true.int()
+    num_missing_edges = torch.sum((G_true.int() == 1) & (G_learned_hard == 0)).item()
+    num_extra_edges = torch.sum((G_true.int() == 0) & (G_learned_hard == 1)).item()
+    num_reversed_edges = 0 # Harder to check without MEC; simple diff doesn't capture this well
+    
+    print(f"Number of missing edges: {num_missing_edges}")
+    print(f"Number of extra edges: {num_extra_edges}")
+    # A true SHD would also consider reversed edges that don't change the MEC for some structures.
+
+    print(f"\nTheta_true:\n{Theta_true.round(decimals=2)}")
+    print(f"Theta_learned (Theta_current):\n{Theta_current.round(decimals=2)}")
+
+    print("\nComparison of Theta coefficients for edges in G_true OR G_learned_hard:")
+    active_coeffs_info = []
+    for r in range(D_nodes):
+        for c in range(D_nodes):
+            true_edge = G_true[r, c].item() == 1
+            learned_edge = G_learned_hard[r, c].item() == 1
+            if true_edge or learned_edge:
+                info = (f"  Edge {r}->{c}: True_coeff={Theta_true[r,c].item():.2f} (Present: {true_edge}), "
+                        f"Learned_coeff={Theta_current[r,c].item():.2f} (Present: {learned_edge})")
+                active_coeffs_info.append(info)
+    if active_coeffs_info:
+        for line in active_coeffs_info:
+            print(line)
+    else:
+        print("  No active edges in either true or learned graph to compare coefficients for.")
+
+
+
 # Run the tests
 if __name__ == '__main__':
     # Unit tests
@@ -379,12 +803,13 @@ if __name__ == '__main__':
     #test_bernoulli_soft_gmat()
     #test_gumbel_soft_gmat()
     #test_gumbel_soft_gmat_reproducibility()
-    test_acyclic_constr()
+    #test_acyclic_constr()
     #test_log_gaussian_likelihood()
     #test_log_bernoulli_likelihood()
     #test_log_full_likelihood()
     #test_log_theta_prior()
     #test_update_dibs_hparams()
+    #test_log_full_likelihood_exact_value()
 
     # Integration tests for gradients
     # These require all the above functions to be correctly defined and imported.
@@ -393,6 +818,11 @@ if __name__ == '__main__':
     #test_grad_z_log_joint_gumbel()
     #test_grad_theta_log_joint()
     #test_grad_log_joint()
+
+    # Single particle gradient ascent test
+    #run_single_particle_gradient_ascent_test()
+    run_single_particle_gradient_ascent_test_with_ground_truth()
+
 
     print("\n--- All tests completed ---")
 
