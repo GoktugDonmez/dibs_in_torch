@@ -894,4 +894,3 @@ class Logistic(Distribution):
             self._validate_sample(value)
         z = (value - self.loc) / self.scale
         return -z - 2 * torch.log(1 + torch.exp(-z)) - torch.log(self.scale)
-
