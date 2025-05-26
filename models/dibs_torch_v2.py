@@ -223,6 +223,7 @@ def scores(z, alpha_hparam):
 
 
 def bernoulli_soft_gmat(z, hparams):
+    ## TODO do the sampling  and sample not the threshold
     """
     Generates a soft adjacency matrix (probabilities) using Bernoulli-Sigmoid.
     P(G_ij=1|Z) = sigmoid(alpha * u_i^T v_j)
@@ -656,9 +657,11 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
     # This means we sample hard G's from Bernoulli(sigma(Z)).
     # For each hard G, we compute log P(D|G,Theta_opt) + log P(Theta_opt|G) and its gradient wrt Theta_opt.
 
-    g_soft_from_fixed_z = bernoulli_soft_gmat(current_z_nonopt, hparams_full) # [D,D] probabilities
+#    g_soft_from_fixed_z = bernoulli_soft_gmat(current_z_nonopt, hparams_full) # [D,D] probabilities
 
     for i in range(n_grad_mc_samples):
+        # TODO look at the expectectation for mc
+        g_soft_from_fixed_z = bernoulli_soft_gmat(current_z_nonopt, hparams_full) # 
         # Sample a hard G ~ Bernoulli(g_soft_from_fixed_z)
         # This hard_g_mc is what's used as `soft_gmat` in log_full_likelihood and `theta_eff`
         # if we follow the "expectation over G" literally.
@@ -682,14 +685,17 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
         theta_prior_mean_val = torch.zeros_like(current_theta_opt, device=device)
         theta_prior_sigma_val = hparams_full.get('theta_prior_sigma', 1.0)
         log_theta_prior_val = log_theta_prior(theta_eff_mc, theta_prior_mean_val, theta_prior_sigma_val)
-        
+        print("log_theta_prior_val----")
+        print(log_theta_prior_val)
+        print("log_lik_val----")
+        print(log_lik_val)
         current_log_density = log_lik_val + log_theta_prior_val
         log_p_samples_list.append(current_log_density.detach())
 
         if current_theta_opt.grad is not None:
             current_theta_opt.grad.zero_()
             
-        grad_curr_log_density_wrt_theta, = torch.autograd.grad(
+        grad_curr_log_density_wrt_theta, = torch.autograd.grad( ## take the grad outside of the loop, take avg of the grad 1/M 
             outputs=current_log_density,
             inputs=current_theta_opt,
             retain_graph=True, # current_theta_opt is used across MC samples
@@ -701,19 +707,21 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
     grad_log_p_wrt_theta_samples = torch.stack(grad_log_p_wrt_theta_list)
     
     # Stable gradient computation (same logic as for Z)
+    ## TODO look for logsumexp trick for the gradient
     log_p_max = torch.max(log_p_samples)
     shifted_log_p = log_p_samples - log_p_max
     exp_shifted_log_p = torch.exp(shifted_log_p)
     
     exp_shifted_log_p_reshaped = exp_shifted_log_p.reshape(-1, *([1]*(current_theta_opt.ndim)))
-
+    print("log_p_samples---- first 5 samples")
+    print(log_p_samples[:5])
     numerator_sum = torch.sum(exp_shifted_log_p_reshaped * grad_log_p_wrt_theta_samples, dim=0)
+    print("numerator_sum.shape-------")
+    print(numerator_sum.shape, numerator_sum)
     denominator_sum = torch.sum(exp_shifted_log_p)
-
-    if denominator_sum < 1e-9:
-        grad_log_likelihood_part_theta = torch.zeros_like(current_theta_opt)
-    else:
-        grad_log_likelihood_part_theta = numerator_sum / denominator_sum
+    print("denominator_sum.shape-------")
+    print(denominator_sum.shape, denominator_sum)
+    grad_log_likelihood_part_theta = numerator_sum / denominator_sum
         
     return grad_log_likelihood_part_theta
 
@@ -915,6 +923,7 @@ def update_dibs_hparams_old(hparams_dict, t_step):
 
 
 def hard_gmat_particles_from_z(z_particles, alpha_hparam_for_scores=1.0):
+    ## TODO do the sampling , no randomness
     """
     Converts Z particles to hard adjacency matrices by thresholding scores.
     z_particles: [N_particles, D, K, 2]
