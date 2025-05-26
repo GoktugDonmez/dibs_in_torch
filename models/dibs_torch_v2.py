@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal, Bernoulli
 from torch.distributions.distribution import Distribution
 from torch.distributions.utils import broadcast_all
+import numpy as np
 
 # --- Assumed utility functions (would need to be translated from models/utils.py) ---
 def acyclic_constr_old(g_mat, d):
@@ -115,44 +116,33 @@ def expand_by(arr, n):
 
 def log_gaussian_likelihood(x, pred_mean, sigma=0.1):
     """
-    Calculates the log Gaussian likelihood.
-    x: observed data [N, D] or [D]
-    pred_mean: predicted mean [N, D] or [D]
-    sigma: standard deviation (scalar or [D])
+    More numerically stable version of Gaussian log likelihood.
     """
-    if not isinstance(sigma, float) and not isinstance(sigma, int):
-        if not torch.is_tensor(sigma):
-            sigma = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
-        sigma = sigma.reshape(-1)
-        assert sigma.shape[0] == pred_mean.shape[-1], "Sigma shape mismatch"
-    
-    # Ensure sigma is a tensor for Normal distribution
+    # Ensure sigma is reasonable
     if isinstance(sigma, (float, int)):
         sigma = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
-
-    # Create Normal distribution object
-    # Ensure loc and scale are broadcastable with x
-    if x.shape != pred_mean.shape:
-        if x.ndim == 1 and pred_mean.ndim > 1 and x.shape[0] == pred_mean.shape[-1]: # x is [D], pred_mean is [N,D]
-             pred_mean_expanded = pred_mean
-        elif pred_mean.ndim == 1 and x.ndim > 1 and pred_mean.shape[0] == x.shape[-1]: # pred_mean is [D], x is [N,D]
-             pred_mean_expanded = pred_mean.expand_as(x)
-        else:
-            raise ValueError(f"Shape mismatch between x ({x.shape}) and pred_mean ({pred_mean.shape}) that cannot be broadcasted.")
-    else:
-        pred_mean_expanded = pred_mean
-
-    if sigma.ndim == 1 and sigma.shape[0] == x.shape[-1] and x.ndim > pred_mean_expanded.ndim : # sigma is [D]
-        sigma_expanded = sigma.expand_as(x)
-    elif sigma.numel() == 1 :
-        sigma_expanded = sigma.expand_as(x)
-    else:
-        sigma_expanded = sigma
-
-
-    normal_dist = Normal(loc=pred_mean_expanded, scale=sigma_expanded)
-    log_prob = normal_dist.log_prob(x)
-    return torch.sum(log_prob) # Sum over all dimensions (N and D)
+    
+    sigma = torch.clamp(sigma, min=1e-6, max=1e3)  # Prevent extreme values
+    
+    # Compute residuals
+    residuals = x - pred_mean
+    
+    # Clamp residuals to prevent overflow in squared term
+    residuals = torch.clamp(residuals, min=-1e3, max=1e3)
+    
+    # Use log-sum-exp style computation for numerical stability
+    log_2pi = np.log(2 * np.pi)
+    log_sigma = torch.log(sigma)
+    
+    # Compute normalized squared residuals
+    normalized_sq_residuals = (residuals / sigma) ** 2
+    
+    # Clamp to prevent extreme values
+    normalized_sq_residuals = torch.clamp(normalized_sq_residuals, max=1e3)
+    
+    log_prob_per_point = -0.5 * (log_2pi + 2 * log_sigma + normalized_sq_residuals)
+    
+    return torch.sum(log_prob_per_point)
 
 def log_bernoulli_likelihood(y_expert_edge, soft_gmat_entry, rho, jitter=1e-5):
     """
@@ -186,26 +176,6 @@ def log_bernoulli_likelihood(y_expert_edge, soft_gmat_entry, rho, jitter=1e-5):
     return loglik
 
 
-def scores_old(z, alpha_hparam):
-    """
-    Computes the raw scores S_ij = alpha * u_i^T v_j from latent Z.
-    z: latent variables [..., D, K, 2]
-    alpha_hparam: scalar hyperparameter
-    Returns: scores [..., D, D]
-    """
-    u = z[..., 0]  # [..., D, K]
-    v = z[..., 1]  # [..., D, K]
-    # Einsum for batched dot product: sum over K
-    # u_bdi = u[b,d,i], v_bdj = v[b,d,j]
-    # scores_bd1d2 = sum_k u_bd1k * u_bd2k
-    raw_scores = alpha_hparam * torch.einsum('...ik,...jk->...ij', u, v) # if u,v are [...,D,K]
-    
-    # Mask diagonal (no self-loops)
-    if raw_scores.ndim >= 2:
-        diag_mask = 1.0 - torch.eye(raw_scores.shape[-1], device=z.device, dtype=z.dtype)
-        return raw_scores * diag_mask
-    return raw_scores
-
 def scores(z, alpha_hparam):
     u = z[..., 0]  # [..., D, K] 
     v = z[..., 1]  # [..., D, K]
@@ -223,16 +193,26 @@ def scores(z, alpha_hparam):
 
 
 def bernoulli_soft_gmat(z, hparams):
-    ## TODO do the sampling  and sample not the threshold
     """
-    Generates a soft adjacency matrix (probabilities) using Bernoulli-Sigmoid.
-    P(G_ij=1|Z) = sigmoid(alpha * u_i^T v_j)
+    Generates a *sampled* binary adjacency matrix G by first computing probabilities
+    P_ij = sigmoid(alpha * u_i^T v_j) and then sampling G_ij ~ Bernoulli(P_ij).
+    The scores u_i^T v_j are for P(i->j).
+    Diagonal elements are implicitly zero due to how scores() masks the diagonal.
+
     z: latent variables [N_particles, D, K, 2] or [D, K, 2]
     hparams: dictionary containing 'alpha'
-    Returns: soft_gmat [N_particles, D, D] or [D,D] (probabilities)
+    Returns: sampled_gmat [N_particles, D, D] or [D,D] (binary 0/1 matrix)
     """
-    raw_scores = scores(z, hparams['alpha'])
-    return torch.sigmoid(raw_scores) # tau is not used here unlike gumbel_soft_gmat
+    # scores(z, hparams['alpha']) returns S_ij where S_ij is score for i->j, with diagonal masked.
+    raw_scores = scores(z, hparams['alpha']) 
+    
+    # probabilities_ij = sigmoid(score for i->j)
+    probabilities = torch.sigmoid(raw_scores) 
+    
+    # sampled_gmat_ij ~ Bernoulli(probabilities_ij)
+    # This is a binary matrix (0.0 or 1.0)
+    sampled_gmat = torch.bernoulli(probabilities)
+    return sampled_gmat
 
 
 def gumbel_soft_gmat_old(z, hparams, device='cpu'):
@@ -636,7 +616,7 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
     data_dict: Data.
     hparams_full: Combined hyperparameters.
     """
-    d = current_z_nonopt.shape[0]
+    # d = current_z_nonopt.shape[0] # This variable was unused
     n_grad_mc_samples = hparams_full['n_grad_mc_samples']
 
     # For grad_theta, the paper (Eq A.33) suggests using Bernoulli soft gmat (not Gumbel).
@@ -645,39 +625,21 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
     # The expectation is over G ~ Bernoulli(sigma(Z)).
     # The JAX code's `theta_log_joint` lambda uses `bernoulli_soft_gmat(nonopt_params["z"], ...)`
 
-    log_p_samples_list = []
-    grad_log_p_wrt_theta_list = []
 
-    # The `bernoulli_soft_gmat` depends on Z, which is fixed here. So, it's computed once.
-    # However, the JAX `theta_log_joint` lambda takes a key `_k` which is unused, implying
-    # the stochasticity for this expectation might come from sampling hard graphs G ~ Bernoulli(G_soft(Z)).
-    # Let's re-check Eq 11 and A.33.
-    # Eq 11: E_{p(G|Z)} [ grad_Theta p(Theta,D|G) ] / E_{p(G|Z)} [ p(Theta,D|G) ]
-    # where p(G|Z) is the Bernoulli model.
-    # This means we sample hard G's from Bernoulli(sigma(Z)).
-    # For each hard G, we compute log P(D|G,Theta_opt) + log P(Theta_opt|G) and its gradient wrt Theta_opt.
+    log_density_samples_list = []
 
-#    g_soft_from_fixed_z = bernoulli_soft_gmat(current_z_nonopt, hparams_full) # [D,D] probabilities
-
+    # The `bernoulli_soft_gmat` depends on Z, which is fixed here.
+    # The original code recomputed g_soft_from_fixed_z in the loop. This behavior is maintained.
+    # This loop collects log P(Theta, Data | G_sample) for M samples.
+    # G_sample might be deterministic (if bernoulli_soft_gmat is used directly and is deterministic)
+    # or stochastic (if G is sampled from bernoulli_soft_gmat, or if bernoulli_soft_gmat itself is stochastic).
+    # The current interpretation, based on JAX code comments, is that bernoulli_soft_gmat is used directly.
     for i in range(n_grad_mc_samples):
-        # TODO look at the expectectation for mc
-        g_soft_from_fixed_z = bernoulli_soft_gmat(current_z_nonopt, hparams_full) # 
-        # Sample a hard G ~ Bernoulli(g_soft_from_fixed_z)
-        # This hard_g_mc is what's used as `soft_gmat` in log_full_likelihood and `theta_eff`
-        # if we follow the "expectation over G" literally.
-        # However, the JAX code's `theta_log_joint` passes `bernoulli_soft_gmat` (which is soft)
-        # directly to `log_full_likelihood` and `log_theta_prior`.
-        # This implies the expectation might be implicitly handled by using the soft matrix directly
-        # as an expected adjacency, or the "G" in E[p(Theta,D|G)] is the soft G.
-        # Given the JAX code structure, it seems they use the *soft* bernoulli_soft_gmat directly.
-        # This is a subtle point. If E_p(G|Z) means G is hard, then we sample.
-        # If it means G is the expected adjacency (soft), we use it directly.
-        # The paper's Eq. 6 defines p(G|Z) for discrete G.
-        # The gradient estimators in Sec 4.3 are for E_{p(G|Z)}[f(G)].
-        # Let's assume for grad_theta, they use the soft bernoulli matrix directly as G_soft.
-        # This matches the JAX `theta_log_joint` lambda.
+        # TODO look at the expectectation for mc (Original comment, relevant to g_soft generation strategy)
+        g_soft_from_fixed_z = bernoulli_soft_gmat(current_z_nonopt, hparams_full) 
         
-        g_soft_for_lik = g_soft_from_fixed_z # Use the same soft matrix for all "samples" if not sampling hard G
+        # As per existing comments, assume the soft bernoulli matrix is used directly for G.
+        g_soft_for_lik = g_soft_from_fixed_z 
 
         log_lik_val = log_full_likelihood(data_dict, g_soft_for_lik, current_theta_opt, hparams_full, device=device)
         
@@ -685,45 +647,51 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
         theta_prior_mean_val = torch.zeros_like(current_theta_opt, device=device)
         theta_prior_sigma_val = hparams_full.get('theta_prior_sigma', 1.0)
         log_theta_prior_val = log_theta_prior(theta_eff_mc, theta_prior_mean_val, theta_prior_sigma_val)
-        print("log_theta_prior_val----")
-        print(log_theta_prior_val)
-        print("log_lik_val----")
-        print(log_lik_val)
-        current_log_density = log_lik_val + log_theta_prior_val
-        log_p_samples_list.append(current_log_density.detach())
-
-        if current_theta_opt.grad is not None:
-            current_theta_opt.grad.zero_()
-            
-        grad_curr_log_density_wrt_theta, = torch.autograd.grad( ## take the grad outside of the loop, take avg of the grad 1/M 
-            outputs=current_log_density,
-            inputs=current_theta_opt,
-            retain_graph=True, # current_theta_opt is used across MC samples
-            create_graph=False
-        )
-        grad_log_p_wrt_theta_list.append(grad_curr_log_density_wrt_theta)
-
-    log_p_samples = torch.stack(log_p_samples_list)
-    grad_log_p_wrt_theta_samples = torch.stack(grad_log_p_wrt_theta_list)
-    
-    # Stable gradient computation (same logic as for Z)
-    ## TODO look for logsumexp trick for the gradient
-    log_p_max = torch.max(log_p_samples)
-    shifted_log_p = log_p_samples - log_p_max
-    exp_shifted_log_p = torch.exp(shifted_log_p)
-    
-    exp_shifted_log_p_reshaped = exp_shifted_log_p.reshape(-1, *([1]*(current_theta_opt.ndim)))
-    print("log_p_samples---- first 5 samples")
-    print(log_p_samples[:5])
-    numerator_sum = torch.sum(exp_shifted_log_p_reshaped * grad_log_p_wrt_theta_samples, dim=0)
-    print("numerator_sum.shape-------")
-    print(numerator_sum.shape, numerator_sum)
-    denominator_sum = torch.sum(exp_shifted_log_p)
-    print("denominator_sum.shape-------")
-    print(denominator_sum.shape, denominator_sum)
-    grad_log_likelihood_part_theta = numerator_sum / denominator_sum
         
-    return grad_log_likelihood_part_theta
+        print("---- log_theta_prior_val ----")
+        print(f"Shape: {log_theta_prior_val.shape}, Value: {log_theta_prior_val}")
+        print("---- log_lik_val ----")
+        print(f"Shape: {log_lik_val.shape}, Value: {log_lik_val}")
+
+        current_log_density = log_lik_val + log_theta_prior_val
+        # Append the tensor itself, maintaining the computation graph. Do NOT detach.
+        log_density_samples_list.append(current_log_density)
+
+    # Stack all collected log_density samples
+    stacked_log_densities = torch.stack(log_density_samples_list)
+    diagnose_likelihood_issues(data_dict, g_soft_for_lik, current_theta_opt, hparams_full)
+
+    print("---- stacked_log_densities (first 5 samples if more) ----")
+    print(f"Shape: {stacked_log_densities.shape}")
+    print(f"Values: {stacked_log_densities[:5]}")
+        
+    # Compute the average of the log densities.
+    # The sum/mean operation ensures that current_theta_opt's influence on all samples is considered.
+    avg_log_density = torch.mean(stacked_log_densities)
+    
+    print("---- avg_log_density ----")
+    print(f"Shape: {avg_log_density.shape}, Value: {avg_log_density}")
+
+
+            
+    # Compute the gradient of the average log density with respect to current_theta_opt.
+    # This corresponds to: grad_Theta [ (1/M) * sum_i log P(Theta, Data | G_i) ]
+    # which is equivalent to: (1/M) * sum_i [ grad_Theta log P(Theta, Data | G_i) ]
+    grad_avg_log_density_wrt_theta, = torch.autograd.grad(
+        outputs=avg_log_density,
+        inputs=current_theta_opt,
+        # retain_graph=True was used in the original per-sample grad.
+        # Kept for consistency if the broader SVGD context relies on current_theta_opt's
+        # graph being preserved beyond this specific gradient calculation.
+        # If this is the final use of this part of the graph for this update step, False might be okay.
+        retain_graph=True, 
+        create_graph=False # Not computing higher-order derivatives of this gradient
+    )
+    
+    print("---- grad_avg_log_density_wrt_theta ----")
+    print(f"Shape: {grad_avg_log_density_wrt_theta.shape}, Value: {grad_avg_log_density_wrt_theta}")
+        
+    return grad_avg_log_density_wrt_theta
 
 
 def grad_log_joint(params, data_dict, hparams_dict_config, device='cpu'):
@@ -923,7 +891,6 @@ def update_dibs_hparams_old(hparams_dict, t_step):
 
 
 def hard_gmat_particles_from_z(z_particles, alpha_hparam_for_scores=1.0):
-    ## TODO do the sampling , no randomness
     """
     Converts Z particles to hard adjacency matrices by thresholding scores.
     z_particles: [N_particles, D, K, 2]

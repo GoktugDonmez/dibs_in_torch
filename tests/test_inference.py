@@ -112,7 +112,7 @@ def run_gradient_ascent_test_with_x1_x2_x3_data():
     # 1. Define Constants and Generate Ground Truth Data
     D_nodes = 3
     K_latent = 3
-    N_samples_data = 200
+    N_samples_data = 500
     synthetic_obs_noise_std = 0.01 # Noise in the synthetic data generation
     ground_truth_seed = 100
 
