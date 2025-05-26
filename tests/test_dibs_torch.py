@@ -490,7 +490,6 @@ def run_single_particle_gradient_ascent_test():
     data_dict = create_dummy_data(N_samples_data, D_nodes, N_expert_edges_data)
 
     # Base Hyperparameters (these will be passed to grad_log_joint, which handles annealing)
-    # Ensure 'alpha_base', 'beta_base', 'tau_base' are present if update_dibs_hparams uses them.
     base_hparams_config = create_dummy_hparams(
         d=D_nodes,
         alpha_val=0.1,  # Starting alpha for annealing (via alpha_base)
@@ -673,24 +672,31 @@ def run_single_particle_gradient_ascent_test_with_ground_truth():
     base_hparams_config = create_dummy_hparams(
         d=D_nodes,
         alpha_val=0.1,
-        beta_val=0.1,
+        beta_val=10, ## increast from 0.1
         tau_val=1.0,
         sigma_z_val=1.0,
         sigma_obs_noise_val=synthetic_obs_noise_std, # Model assumes same noise as data generation
         rho_val=0.05, # Not used if data_dict['y'] is None
         temp_ratio_val=0.0, # No expert data, so this won't have effect
-        n_grad_mc_samples_val=10, # More MC samples for better gradient estimates
-        n_nongrad_mc_samples_val=10,
+        n_grad_mc_samples_val=20, # More MC samples for better gradient estimates
+        n_nongrad_mc_samples_val=20,
         theta_prior_sigma_val=0.5 # Prior on learned Theta_eff
     )
 
-    lr_z = 0.001
-    lr_theta = 0.001
-    num_iterations = 15 # Increase for a better chance to learn
+
+    # initial ones commented out
+    lr_z = 0.001 # 0.01
+    lr_theta = 0.001 # 0.01
+    max_grad_norm_z = 10.0
+    max_grad_norm_theta = 50.0 
+    num_iterations = 200 # 200 # Increase for a better chance to learn
+
 
     print(f"\nInitial Z (norm): {Z_current.norm().item():.4f}")
     print(f"Initial Theta (norm): {Theta_current.norm().item():.4f}")
     print(f"Initial Theta values:\n{Theta_current}")
+    print(f"Learning rates: lr_z={lr_z}, lr_theta={lr_theta}")
+    print(f"Gradient clipping norms: max_Z_grad={max_grad_norm_z}, max_Theta_grad={max_grad_norm_theta}")
 
 
     for t_iter in range(num_iterations):
@@ -710,6 +716,8 @@ def run_single_particle_gradient_ascent_test_with_ground_truth():
             grads = grad_log_joint(params_for_calc, data_dict, base_hparams_config, device='cpu')
             grad_z = grads['z']
             grad_theta = grads['theta']
+            torch.nn.utils.clip_grad_norm_(grad_z, max_grad_norm_z)
+            torch.nn.utils.clip_grad_norm_(grad_theta, max_grad_norm_theta)
             grad_z_norm = grad_z.norm().item()
             grad_theta_norm = grad_theta.norm().item()
         except Exception as e:
@@ -794,6 +802,33 @@ def run_single_particle_gradient_ascent_test_with_ground_truth():
     else:
         print("  No active edges in either true or learned graph to compare coefficients for.")
 
+## issues with acyclic constr found during testing adding a new test for it
+def test_acyclic_constr_rigorous():
+    print("\nTesting acyclic_constr() rigorously for D=2...")
+    d = 2
+    # Acyclic: 0 -> 1
+    g_acyclic = torch.tensor([[0., 1.], [0., 0.]])
+    # h(G) = tr((I + G/d)^d) - d
+    # I + G/2 = [[1, 0.5], [0, 1]]
+    # (I + G/2)^2 = [[1, 0.5], [0, 1]] @ [[1, 0.5], [0, 1]] = [[1, 1], [0, 1]]
+    # tr = 1 + 1 = 2
+    # h(G) = 2 - 2 = 0
+    h_val_acyclic = acyclic_constr(g_acyclic, d)
+    print(f"  h(G_acyclic_D2): {h_val_acyclic.item()}")
+    assert math.isclose(h_val_acyclic.item(), 0.0, abs_tol=1e-6), "h(G) for discrete acyclic D=2 should be 0"
+
+    # Cyclic: 0 -> 1, 1 -> 0
+    g_cyclic = torch.tensor([[0., 1.], [1., 0.]])
+    # I + G/2 = [[1, 0.5], [0.5, 1]]
+    # (I + G/2)^2 = [[1, 0.5], [0.5, 1]] @ [[1, 0.5], [0.5, 1]] = [[1.25, 1], [1, 1.25]]
+    # tr = 1.25 + 1.25 = 2.5
+    # h(G) = 2.5 - 2 = 0.5
+    h_val_cyclic = acyclic_constr(g_cyclic, d)
+    print(f"  h(G_cyclic_D2): {h_val_cyclic.item()}")
+    assert math.isclose(h_val_cyclic.item(), 0.5, abs_tol=1e-6), "h(G) for 0->1,1->0 cycle in D=2 should be 0.5"
+    print("  acyclic_constr() rigorous D=2 test passed.")
+
+
 
 
 # Run the tests
@@ -804,6 +839,7 @@ if __name__ == '__main__':
     #test_gumbel_soft_gmat()
     #test_gumbel_soft_gmat_reproducibility()
     #test_acyclic_constr()
+    #test_acyclic_constr_rigorous()
     #test_log_gaussian_likelihood()
     #test_log_bernoulli_likelihood()
     #test_log_full_likelihood()

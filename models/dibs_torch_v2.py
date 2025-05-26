@@ -5,7 +5,7 @@ from torch.distributions.distribution import Distribution
 from torch.distributions.utils import broadcast_all
 
 # --- Assumed utility functions (would need to be translated from models/utils.py) ---
-def acyclic_constr(g_mat, d):
+def acyclic_constr_old(g_mat, d):
     """
     Computes the acyclicity constraint h(G) = tr((I + alpha*G)^d) - d.
     g_mat: [d, d] tensor, the graph adjacency matrix (can be soft)
@@ -25,6 +25,33 @@ def acyclic_constr(g_mat, d):
 
     h = torch.trace(m_mult) - d
     return h
+def acyclic_constr(g_mat, d):
+    """Efficient fixed acyclicity constraint using eigendecomposition or series expansion."""
+    alpha = 1.0 / d
+    eye = torch.eye(d, device=g_mat.device, dtype=g_mat.dtype)
+    m = eye + alpha * g_mat
+    
+    # For small d, use matrix power
+    if d <= 10:
+        m_mult = torch.linalg.matrix_power(m, d)
+        return torch.trace(m_mult) - d
+    
+    # For larger d, use eigendecomposition or series approximation
+    try:
+        eigenvals = torch.linalg.eigvals(m)
+        # trace(M^d) = sum(lambda_i^d)
+        h = torch.sum(torch.real(eigenvals ** d)) - d
+        return h
+    except:
+        # Fallback to series expansion for very large or ill-conditioned matrices
+        # h(G) ≈ trace(sum_{k=1}^{d} (alphaG)^k) using series expansion
+        trace_sum = torch.tensor(0.0, device=g_mat.device, dtype=g_mat.dtype)
+        power_g = g_mat
+        for k in range(1, min(d+1, 20)):  # Truncate series for efficiency
+            trace_sum += (alpha ** k) * torch.trace(power_g) / k
+            if k < min(d, 19):
+                power_g = torch.matmul(power_g, g_mat)
+        return trace_sum
 
 def stable_mean(fxs, dim=0, keepdim=False):
     """
@@ -159,7 +186,7 @@ def log_bernoulli_likelihood(y_expert_edge, soft_gmat_entry, rho, jitter=1e-5):
     return loglik
 
 
-def scores(z, alpha_hparam):
+def scores_old(z, alpha_hparam):
     """
     Computes the raw scores S_ij = alpha * u_i^T v_j from latent Z.
     z: latent variables [..., D, K, 2]
@@ -179,6 +206,21 @@ def scores(z, alpha_hparam):
         return raw_scores * diag_mask
     return raw_scores
 
+def scores(z, alpha_hparam):
+    u = z[..., 0]  # [..., D, K] 
+    v = z[..., 1]  # [..., D, K]
+    # Correct: for each (i,j) pair, compute u_i^T v_j
+    raw_scores = alpha_hparam * torch.einsum('...ik,...jk->...ij', u, v)
+    
+    # Mask diagonal properly
+    *batch_dims, d, _ = z.shape[:-1]
+    diag_mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
+    if batch_dims:
+        diag_mask = diag_mask.expand(*batch_dims, d, d)
+    
+    return raw_scores * diag_mask
+
+
 
 def bernoulli_soft_gmat(z, hparams):
     """
@@ -192,7 +234,7 @@ def bernoulli_soft_gmat(z, hparams):
     return torch.sigmoid(raw_scores) # tau is not used here unlike gumbel_soft_gmat
 
 
-def gumbel_soft_gmat(z, hparams, device='cpu'):
+def gumbel_soft_gmat_old(z, hparams, device='cpu'):
     """
     Generates a soft adjacency matrix using Gumbel-Sigmoid reparameterization.
     G_ij = sigmoid(tau * (logistic_noise_ij + alpha * u_i^T v_j))
@@ -219,6 +261,25 @@ def gumbel_soft_gmat(z, hparams, device='cpu'):
     soft_gmat = torch.sigmoid(hparams['tau'] * gumbel_input)
 
     # Mask diagonal
+    diag_mask = 1.0 - torch.eye(d, device=device, dtype=z.dtype)
+    return soft_gmat * diag_mask
+
+def gumbel_soft_gmat(z, hparams, device=None):
+    if device is None:
+        device = z.device
+    
+    d = z.shape[0]
+    raw_scores = scores(z, hparams['alpha'])
+    
+    # Proper logistic sampling
+    u = torch.rand(d, d, device=device, dtype=z.dtype)
+    logistic_noise = torch.log(u) - torch.log(1 - u)
+    
+    # Gumbel-Sigmoid with proper broadcasting
+    gumbel_input = (logistic_noise + raw_scores) * hparams['tau']
+    soft_gmat = torch.sigmoid(gumbel_input)
+    
+    # Proper diagonal masking
     diag_mask = 1.0 - torch.eye(d, device=device, dtype=z.dtype)
     return soft_gmat * diag_mask
 
@@ -775,6 +836,14 @@ def log_joint(params, data_dict, hparams_dict_config, device='cpu'):
 
 
 def update_dibs_hparams(hparams_dict, t_step):
+    update_dibs_hparams = hparams_dict.copy()
+    update_dibs_hparams['tau'] = hparams_dict['tau']
+    update_dibs_hparams['alpha'] = hparams_dict['alpha'] * (t_step + 1 / t_step)
+    update_dibs_hparams['beta'] = hparams_dict['beta'] * (t_step + 1 / t_step)
+    return update_dibs_hparams
+
+
+def update_dibs_hparams_old(hparams_dict, t_step):
     """
     Updates hyperparameters that anneal with time step t_step.
     Modifies hparams_dict in place or returns a new one.
