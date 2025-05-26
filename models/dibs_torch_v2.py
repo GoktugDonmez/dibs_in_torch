@@ -4,6 +4,10 @@ from torch.distributions import Normal, Bernoulli
 from torch.distributions.distribution import Distribution
 from torch.distributions.utils import broadcast_all
 import numpy as np
+import logging
+
+# Get a logger for this module
+log = logging.getLogger("DiBS")
 
 # --- Assumed utility functions (would need to be translated from models/utils.py) ---
 def acyclic_constr_old(g_mat, d):
@@ -540,6 +544,9 @@ def grad_z_log_joint_gumbel(current_z_opt, current_theta_nonopt, data_dict, hpar
         theta_prior_sigma_val = hparams_full.get('theta_prior_sigma', 1.0)
         log_theta_prior_val = log_theta_prior(theta_eff_mc, theta_prior_mean_val, theta_prior_sigma_val)
         
+        log.debug(f"---- log_theta_prior_val ---- Shape: {log_theta_prior_val.shape}, Value: {log_theta_prior_val}")
+        log.debug(f"---- log_lik_val ---- Shape: {log_lik_val.shape}, Value: {log_lik_val}")
+
         current_log_density = log_lik_val + log_theta_prior_val
         log_p_samples_list.append(current_log_density.detach()) # Detach for storing value, grad comes next
 
@@ -648,48 +655,29 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
         theta_prior_sigma_val = hparams_full.get('theta_prior_sigma', 1.0)
         log_theta_prior_val = log_theta_prior(theta_eff_mc, theta_prior_mean_val, theta_prior_sigma_val)
         
-        print("---- log_theta_prior_val ----")
-        print(f"Shape: {log_theta_prior_val.shape}, Value: {log_theta_prior_val}")
-        print("---- log_lik_val ----")
-        print(f"Shape: {log_lik_val.shape}, Value: {log_lik_val}")
-
         current_log_density = log_lik_val + log_theta_prior_val
         # Append the tensor itself, maintaining the computation graph. Do NOT detach.
         log_density_samples_list.append(current_log_density)
 
     # Stack all collected log_density samples
     stacked_log_densities = torch.stack(log_density_samples_list)
-    diagnose_likelihood_issues(data_dict, g_soft_for_lik, current_theta_opt, hparams_full)
 
-    print("---- stacked_log_densities (first 5 samples if more) ----")
-    print(f"Shape: {stacked_log_densities.shape}")
-    print(f"Values: {stacked_log_densities[:5]}")
+    log.debug(f"---- stacked_log_densities ---- Shape: {stacked_log_densities.shape}")
+    log.debug(f"---- stacked_log_densities ---- Values: {stacked_log_densities}")
         
-    # Compute the average of the log densities.
-    # The sum/mean operation ensures that current_theta_opt's influence on all samples is considered.
     avg_log_density = torch.mean(stacked_log_densities)
     
-    print("---- avg_log_density ----")
-    print(f"Shape: {avg_log_density.shape}, Value: {avg_log_density}")
+    log.debug(f"---- avg_log_density ---- Shape: {avg_log_density.shape}, Value: {avg_log_density}")
 
 
             
-    # Compute the gradient of the average log density with respect to current_theta_opt.
-    # This corresponds to: grad_Theta [ (1/M) * sum_i log P(Theta, Data | G_i) ]
-    # which is equivalent to: (1/M) * sum_i [ grad_Theta log P(Theta, Data | G_i) ]
     grad_avg_log_density_wrt_theta, = torch.autograd.grad(
         outputs=avg_log_density,
         inputs=current_theta_opt,
-        # retain_graph=True was used in the original per-sample grad.
-        # Kept for consistency if the broader SVGD context relies on current_theta_opt's
-        # graph being preserved beyond this specific gradient calculation.
-        # If this is the final use of this part of the graph for this update step, False might be okay.
         retain_graph=True, 
-        create_graph=False # Not computing higher-order derivatives of this gradient
     )
     
-    print("---- grad_avg_log_density_wrt_theta ----")
-    print(f"Shape: {grad_avg_log_density_wrt_theta.shape}, Value: {grad_avg_log_density_wrt_theta}")
+    log.debug(f"---- grad_avg_log_density_wrt_theta ---- Shape: {grad_avg_log_density_wrt_theta.shape}, Value: {grad_avg_log_density_wrt_theta}")
         
     return grad_avg_log_density_wrt_theta
 

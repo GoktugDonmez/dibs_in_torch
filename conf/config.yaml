@@ -1,0 +1,66 @@
+# conf/config.yaml
+hydra:
+  job_logging:
+    formatters:
+      ultra_short: # A new formatter name
+        format: '[%(asctime)s][%(name).1s][%(levelname).1s] %(message)s' # Even shorter
+        datefmt: '%H:%M:%S' # Time only, no date
+    handlers:
+      console:
+        formatter: ultra_short # Use your new custom formatter
+      file:
+        formatter: ultra_short # Use your new custom formatter
+    # Optional: Define default levels for your loggers
+    # loggers:
+    #   InferTest:
+    #     level: INFO
+    #   DiBS:
+    #     level: DEBUG # Example: If you want DiBS logs to be DEBUG by default
+
+defaults:
+  - override hydra/job_logging: default # Or your custom logging config if you separated it
+
+
+
+# General experiment parameters
+project_name: "dibs_torch_v2_experiment"
+experiment_name: "x1_x2_x3_ground_truth"
+seed: 100 # This can be a global seed
+
+# Data generation parameters
+data:
+  d_nodes: 3
+  num_samples: 500
+  synthetic_obs_noise_std: 0.01
+  ground_truth_seed: 100 # from data_package generation in test_inference.py
+
+# Particle initialization
+particle:
+  k_latent: 3
+  init_seed_offset: 1 # Z_seed = global_seed + init_seed_offset, Theta_seed = global_seed + init_seed_offset + 1
+
+# DiBS Model Hyperparameters (from base_hparams_config)
+model_hparams:
+  alpha_val: 0.1
+  beta_val: 1.0
+  tau_val: 1.0
+  # sigma_z_val: "1/math.sqrt(K_latent)" # Hydra can't directly evaluate this, set explicitly or compute in script
+  sigma_z_val_divisor_for_k_latent: 1.0 # We'll compute sigma_z = 1.0 / (sqrt(k_latent) * this_divisor)
+  sigma_obs_noise_val_is_data_noise: true # Flag to use data.synthetic_obs_noise_std
+  rho_val: 0.05
+  temp_ratio_val: 0.0
+  n_grad_mc_samples_val: 5
+  n_nongrad_mc_samples_val: 10
+  theta_prior_sigma_val: 0.5
+
+# Training/Optimization parameters
+training:
+  lr_z: 0.005
+  lr_theta: 0.005
+  num_iterations: 1 # Default from your test script
+  max_grad_norm_z: 11.0
+  max_grad_norm_theta: 19.0
+  # Annealing step will be managed by the iteration loop
+
+# Default device
+device: 'cpu'
