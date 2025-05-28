@@ -60,20 +60,131 @@ def acyclic_constr(g_mat, d):
 
 def stable_mean(fxs, dim=0, keepdim=False):
     """
-    Computes a more stable mean, especially if fxs contains very small positive numbers.
-    The JAX version had a more complex handling for positive and negative values.
-    This is a simplified version assuming fxs are mostly positive or their log is taken.
-    If fxs can be negative, the JAX version's logic for splitting positive/negative
-    and using logsumexp on their absolute values would be needed.
-    For now, we'll use a simple mean, assuming inputs are well-behaved for averaging
-    or that the calling function handles logs appropriately for logsumexp-style averaging.
+    Computes a stable mean based on the JAX implementation logic provided.
+    This version handles positive and negative values separately using logsumexp
+    for potentially improved stability with numbers of widely varying magnitudes.
+
+    Args:
+        fxs (torch.Tensor): Input tensor.
+        dim (int or tuple of ints, optional): The dimension or dimensions to reduce.
+            If None (default in underlying logic if input `dim` leads to it, e.g. for scalar),
+            reduces all dimensions. Default is 0.
+        keepdim (bool, optional): Whether the output tensor has `dim` retained or not.
+            Default is False.
+
+    Returns:
+        torch.Tensor: Tensor with the stable mean.
+
+    Note:
+    - For empty inputs or slices (e.g., a dimension of size 0), this
+      implementation returns 0. This differs from `torch.mean`, which returns NaN.
+    - If `fxs` is a scalar and `dim` is specified (e.g., `dim=0`), this function
+      treats `dim` as `None` (reducing all dimensions, i.e., returning the scalar
+      itself). `torch.mean` would raise an error in such a case.
+    - The input tensor `fxs` will be converted to a floating-point dtype if it's
+      not already, as `torch.log` requires float or complex inputs.
     """
-    # A common way to stabilize mean of log-probabilities (if fxs are log-probs)
-    # is logsumexp(fxs) - log(N)
-    # If fxs are probabilities, torch.mean is usually fine.
-    # The original `stable_mean` in JAX was more elaborate.
-    # For gradients, a simple mean is often what's needed if the terms are already gradients.
-    return torch.mean(fxs, dim=dim, keepdim=keepdim)
+    jitter = 1e-30
+
+    if not fxs.is_floating_point():
+        # Promote fxs to the default floating-point type for log operations
+        fxs = fxs.to(torch.get_default_dtype())
+
+    # Determine effective dim and keepdim for internal operations
+    # If fxs is scalar, dim effectively becomes None, and keepdim is effectively False
+    # as the output will be scalar.
+    is_scalar_input = (fxs.ndim == 0)
+    effective_dim = dim
+    if is_scalar_input:
+        effective_dim = None
+
+    # Configure reduction dimensions and total element count for the mean
+    if effective_dim is None:
+        # Reduce over all dimensions
+        sum_reduce_dims = list(range(fxs.ndim)) if fxs.ndim > 0 else []
+        n_total_elements_val = fxs.numel()
+        # When reducing all dims, internal keepdim for logsumexp/sum should be False
+        # as the intermediate sum (sum_psve, sum_ngve_abs) will be scalar.
+        internal_keepdim = False
+    else:
+        # Reduce over specified dimension(s)
+        sum_reduce_dims = effective_dim
+        if isinstance(effective_dim, int):
+            n_total_elements_val = fxs.shape[effective_dim]
+        else:  # effective_dim is a tuple of dimensions
+            n_total_elements_val = 1
+            for d_idx in effective_dim:
+                n_total_elements_val *= fxs.shape[d_idx]
+        # Internal sums should keep the reduced dimension for broadcasting
+        internal_keepdim = True
+
+    n_total = torch.tensor(n_total_elements_val, device=fxs.device, dtype=fxs.dtype)
+
+    # Create masks for positive and negative values
+    positive_mask = fxs > 0.0
+    negative_mask = fxs < 0.0
+
+    # Isolate contributions from positive and absolute negative values
+    # Values are original where mask is true, 0 otherwise.
+    fxs_psve_contrib = fxs * positive_mask
+    fxs_ngve_contrib = -fxs * negative_mask  # Absolute values of negative contributions
+
+    # Calculate sum of positive contributions using log-sum-exp
+    # torch.log(0.0) is -inf. torch.logsumexp handles -inf correctly.
+    # If all contributions are 0 (no positive values), sum will be exp(-inf) = 0.
+    log_fxs_psve_contrib = torch.log(fxs_psve_contrib)
+    sum_psve = torch.exp(torch.logsumexp(log_fxs_psve_contrib, dim=sum_reduce_dims, keepdim=internal_keepdim))
+
+    # Calculate sum of absolute negative contributions using log-sum-exp
+    log_fxs_ngve_contrib = torch.log(fxs_ngve_contrib)
+    sum_ngve_abs = torch.exp(torch.logsumexp(log_fxs_ngve_contrib, dim=sum_reduce_dims, keepdim=internal_keepdim))
+
+    # Count positive elements and non-positive elements (JAX's n_ngve logic)
+    # Ensure counts match fxs.dtype and dimensionality of sums for broadcasting.
+    n_psve = torch.sum(positive_mask, dim=sum_reduce_dims, keepdim=internal_keepdim).to(fxs.dtype)
+
+    if effective_dim is None: # n_total is scalar, n_psve is scalar
+        n_ngve_jax = n_total - n_psve
+    else: # n_total is scalar (shape[dim]), n_psve is a tensor due to internal_keepdim=True
+        n_ngve_jax = n_total.to(fxs.dtype) - n_psve # n_total broadcasts
+
+    # Calculate average of positive contributions
+    # Initialize with zeros; shape matches sum_psve
+    avg_psve = torch.zeros_like(sum_psve)
+    # Mask for elements where n_psve > 0 to avoid division by zero
+    psve_calc_mask = n_psve > 0
+    # n_psve and sum_psve have same shape due to consistent internal_keepdim.
+    # So direct indexing with psve_calc_mask is fine.
+    if torch.any(psve_calc_mask): # Avoids indexing empty tensor if all n_psve are 0
+        avg_psve[psve_calc_mask] = sum_psve[psve_calc_mask] / (n_psve[psve_calc_mask] + jitter)
+
+    # Calculate average of absolute negative contributions (JAX's avg_ngve logic)
+    avg_ngve = torch.zeros_like(sum_ngve_abs)
+    # Mask for elements where n_ngve_jax > 0 (denominator for this average)
+    ngve_calc_mask = n_ngve_jax > 0
+    if torch.any(ngve_calc_mask):
+        avg_ngve[ngve_calc_mask] = sum_ngve_abs[ngve_calc_mask] / (n_ngve_jax[ngve_calc_mask] + jitter)
+
+    # Combine terms based on the JAX formula structure
+    # n_total is scalar. Add jitter for safety if n_total_elements_val could be 0.
+    safe_n_total = n_total + jitter
+    # If n_total_elements_val is 0, safe_n_total is jitter. All sums and counts
+    # (sum_psve, sum_ngve_abs, n_psve, n_ngve_jax) will be 0. Result becomes 0.
+
+    term_psve = (n_psve / safe_n_total) * avg_psve
+    term_ngve = (n_ngve_jax / safe_n_total) * avg_ngve
+    result = term_psve - term_ngve
+
+    # Final keepdim handling
+    if is_scalar_input:
+        # For scalar input, result is already scalar. keepdim is effectively False.
+        return result
+    
+    if effective_dim is not None and not keepdim:
+        # Squeeze the reduced dimension(s) if keepdim is False
+        result = result.squeeze(effective_dim)
+    
+    return result
 
 def expand_by(arr, n):
     """
@@ -146,7 +257,8 @@ def log_gaussian_likelihood(x, pred_mean, sigma=0.1):
     
     log_prob_per_point = -0.5 * (log_2pi + 2 * log_sigma + normalized_sq_residuals)
     
-    return torch.sum(log_prob_per_point)
+    # DIVING TO GET AVERAGE LOG LIKELIHOOD WHY ? 
+    return torch.sum(log_prob_per_point) / x.shape[0]          # average
 
 def log_bernoulli_likelihood(y_expert_edge, soft_gmat_entry, rho, jitter=1e-5):
     """
@@ -407,11 +519,14 @@ def gumbel_acyclic_constr_mc(z_particle, d, hparams, n_mc_samples, device='cpu')
         # The JAX `gumbel_soft_gmat(k, z, ...)` takes a key `k` for randomness.
         # Here, we generate noise inside gumbel_soft_gmat.
         g_soft = gumbel_soft_gmat(z_particle, hparams, device=device)
-        h_samples.append(acyclic_constr(g_soft, d))
-    
-    if not h_samples: # Should not happen if n_mc_samples > 0
-        return torch.tensor(0.0, device=device)
         
+        # TODO WHICH IS CORRECT
+        #  we should give hard gmat to get h values?
+        h_samples.append(acyclic_constr(torch.bernoulli(g_soft), d))
+        
+        # h_samples.append(acyclic_constr(g_soft, d))
+    
+
     return torch.mean(torch.stack(h_samples))
 
 
@@ -499,31 +614,7 @@ def grad_z_log_joint_gumbel(current_z_opt, current_theta_nonopt, data_dict, hpar
     
     grad_log_z_prior_total = grad_log_z_prior_acyclicity + grad_log_z_prior_gaussian
 
-    # 2. Gradient of E_G_soft [ log P(Theta, Data | G_soft(Z)) ] (log of expectation, using score identity)
-    #    This is the term: (grad_Z E[P(Theta,Data|G_soft)]) / E[P(Theta,Data|G_soft)]
-    #    The JAX code implements this using logsumexp for stability with MC samples of
-    #    log P(Theta, Data | G_soft(Z, L)) and grad_Z log P(Theta, Data | G_soft(Z, L)).
-
-    # Define log_density_z_fn(z_arg, l_noise_idx_for_gumbel_key)
-    # This function calculates log P(Theta, Data | G_soft(z_arg, L)) + log P(Theta_eff | G_soft(z_arg,L))
-    # JAX version: log_density_z = lambda k_gumbel, z_lambda: log_full_likelihood(...) + log_theta_prior(...)
-    # where soft_gmat in log_full_likelihood is gumbel_soft_gmat(k_gumbel, z_lambda, ...)
-    # and theta_effective in log_theta_prior is current_theta_nonopt * gumbel_soft_gmat(k_gumbel, z_lambda, ...)
-
-    log_density_values_for_mc = []
-    # For grad_z_of_log_density_values_for_mc, we need to compute grad w.r.t. current_z_opt.
-    # This requires current_z_opt to be part of the computation graph for each MC sample.
-    
-    # Store gradients of log_density w.r.t current_z_opt for each MC sample
-    # PyTorch autograd.grad is better here than .backward() if we want specific gradients.
-    
-    # For the stable gradient computation (similar to JAX logsumexp trick for gradients):
-    # We need:
-    #   log_p_samples: [n_grad_mc_samples] - values of log_density_z(k, current_z_opt)
-    #   grad_log_p_samples: [n_grad_mc_samples, D, K, 2] - values of grad_z log_density_z(k, z) |_{z=current_z_opt}
-
     log_p_samples_list = []
-    grad_log_p_wrt_z_list = []
 
     for i in range(n_grad_mc_samples):
         # Ensure z_opt is used in a way that its gradient can be taken for this sample
@@ -548,50 +639,15 @@ def grad_z_log_joint_gumbel(current_z_opt, current_theta_nonopt, data_dict, hpar
         log.debug(f"---- log_lik_val ---- Shape: {log_lik_val.shape}, Value: {log_lik_val}")
 
         current_log_density = log_lik_val + log_theta_prior_val
-        log_p_samples_list.append(current_log_density.detach()) # Detach for storing value, grad comes next
+        log_p_samples_list.append(current_log_density) # Detach for storing value, grad comes next
 
-        # Gradient of current_log_density w.r.t current_z_opt
-        if current_z_opt.grad is not None:
-            current_z_opt.grad.zero_() # Zero out previous grads if any (though torch.autograd.grad doesn't accumulate like .backward())
-            
-        grad_curr_log_density_wrt_z, = torch.autograd.grad(
-            outputs=current_log_density,
-            inputs=current_z_opt,
-            retain_graph=True, # Important: current_z_opt is used across MC samples
-            create_graph=False # Not taking higher-order derivatives of this gradient
-        )
-        grad_log_p_wrt_z_list.append(grad_curr_log_density_wrt_z)
+
 
     # Stack the collected tensors
-    log_p_samples = torch.stack(log_p_samples_list) # [n_grad_mc_samples]
-    grad_log_p_wrt_z_samples = torch.stack(grad_log_p_wrt_z_list) # [n_grad_mc_samples, D, K, 2]
+    log_p_samples = torch.stack(log_p_samples_list, dim=0) # [n_grad_mc_samples]
+    mean_log_p_samples = log_p_samples.mean()
+    grad_curr_log_density_wrt_z, = torch.autograd.grad(outputs=mean_log_p_samples, inputs=current_z_opt)
 
-    # Clean up graph for current_z_opt if retain_graph was True for the last grad computation
-    # This is tricky. If current_z_opt is a leaf node in an outer optimization,
-    # its graph should be retained until the optimizer step.
-    # If torch.autograd.grad was used with retain_graph=True, need to be careful.
-    # A common pattern is to ensure ops inside the loop don't affect subsequent iterations' grad computations
-    # unless intended. Cloning z_opt for each loop or careful grad zeroing might be needed if issues arise.
-    # For now, assume `retain_graph=True` in `autograd.grad` is handled correctly by SVGD's structure.
-
-    # Compute stable gradient: sum_s (w_s * grad_s) where w_s = exp(log_p_s - logsumexp(log_p_all))
-    # This is E_{L_s}[grad_Z log P(Theta,Data|G(Z,L_s))] where the expectation is weighted by P(Theta,Data|G(Z,L_s))
-    # JAX code:
-    # lse_numerator = tree_map(lambda leaf_z: logsumexp(a=expand_by(log_p_samples, leaf_z.ndim-1), b=leaf_z, axis=0, return_sign=True)[0], grad_log_p_wrt_z_samples)
-    # sign_lse_numerator = ... [1]
-    # lse_denominator = logsumexp(a=log_p_samples, axis=0)
-    # stable_grad_lik_part = sign * exp(lse_num - log(N) - lse_den + log(N)) = sign * exp(lse_num - lse_den)
-
-    # PyTorch equivalent:
-    # log_weights = F.log_softmax(log_p_samples, dim=0) # log_p_s - logsumexp(log_p_all)
-    # weights = torch.exp(log_weights) # [n_grad_mc_samples]
-    # grad_lik_part = torch.sum(weights.reshape(-1, 1, 1, 1) * grad_log_p_wrt_z_samples, dim=0)
-    
-    # Let's follow JAX more closely for the "gradient of log of expectation"
-    # grad_log_E[X] = (grad E[X]) / E[X] = (E[grad X]) / E[X] if reparam, or (E[X grad log P]) / E[X] if score fn.
-    # The JAX code is essentially computing E_L[grad_z log_density(Z,L)] / E_L[1] but weighted.
-    # It's an estimator for grad_Z log E_L [ exp(log_density(Z,L)) ]
-    # = ( E_L [ exp(log_density(Z,L)) * grad_Z log_density(Z,L) ] ) / E_L [ exp(log_density(Z,L)) ]
 
     # To avoid numerical issues with exp(log_p_samples):
     log_p_max = torch.max(log_p_samples)
@@ -604,10 +660,10 @@ def grad_z_log_joint_gumbel(current_z_opt, current_theta_nonopt, data_dict, hpar
     # Reshape for broadcasting: exp_shifted_log_p needs to be [N, 1, 1, 1]
     exp_shifted_log_p_reshaped = exp_shifted_log_p.reshape(-1, *([1]*(current_z_opt.ndim)))
 
-    numerator_sum = torch.sum(exp_shifted_log_p_reshaped * grad_log_p_wrt_z_samples, dim=0)
+    numerator_sum = torch.sum(exp_shifted_log_p_reshaped * grad_curr_log_density_wrt_z, dim=0)
     denominator_sum = torch.sum(exp_shifted_log_p)
 
-    if denominator_sum < 1e-9: # Avoid division by zero
+    if denominator_sum < 1e-33: # Avoid division by zero
         grad_log_likelihood_part = torch.zeros_like(current_z_opt)
     else:
         grad_log_likelihood_part = numerator_sum / denominator_sum
@@ -668,13 +724,14 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
     avg_log_density = torch.mean(stacked_log_densities)
     
     log.debug(f"---- avg_log_density ---- Shape: {avg_log_density.shape}, Value: {avg_log_density}")
-
+    # Log current_theta_opt and log_lik_val before gradient calculation
+    log.debug(f"---- current_theta_opt (before grad) ---- Shape: {current_theta_opt.shape}, Values:\n{current_theta_opt.detach().round(decimals=4)}")
+    log.debug(f"---- log_lik_val (sample from mean calculation) ---- Shape: {log_lik_val.shape}, Value: {log_lik_val.detach().round(decimals=4)}")
 
             
     grad_avg_log_density_wrt_theta, = torch.autograd.grad(
         outputs=avg_log_density,
         inputs=current_theta_opt,
-        retain_graph=True, 
     )
     
     log.debug(f"---- grad_avg_log_density_wrt_theta ---- Shape: {grad_avg_log_density_wrt_theta.shape}, Value: {grad_avg_log_density_wrt_theta}")
@@ -692,6 +749,8 @@ def grad_log_joint(params, data_dict, hparams_dict_config, device='cpu'):
     hparams_dict_config: dict of hyperparameters from config.
     """
     # Ensure params require grad
+    hparams = update_dibs_hparams(hparams_dict_config, params["t"].item())
+
     current_z = params['z'] # Should be [D, K, 2] for a single particle
     current_theta = params['theta'] # Should be [D, D] for a single particle
     
@@ -732,7 +791,7 @@ def grad_log_joint(params, data_dict, hparams_dict_config, device='cpu'):
         current_z_opt=current_z,
         current_theta_nonopt=current_theta.detach(), # Treat theta as fixed for dZ
         data_dict=data_dict,
-        hparams_full=hparams_and_current_params, # Pass merged params
+        hparams_full=hparams, # Pass merged params
         device=device
     )
     
@@ -742,7 +801,7 @@ def grad_log_joint(params, data_dict, hparams_dict_config, device='cpu'):
         current_z_nonopt=current_z.detach(), # Treat z as fixed for dTheta
         current_theta_opt=current_theta,
         data_dict=data_dict,
-        hparams_full=hparams_and_current_params, # Pass merged params
+        hparams_full=hparams, # Pass merged params
         device=device
     )
     
@@ -801,81 +860,16 @@ def log_joint(params, data_dict, hparams_dict_config, device='cpu'):
 
 def update_dibs_hparams(hparams_dict, t_step):
     update_dibs_hparams = hparams_dict.copy()
+    t = max(float(t_step), 1.0e-3)
+    factor = t + 1.0 / t
+
     update_dibs_hparams['tau'] = hparams_dict['tau']
-    update_dibs_hparams['alpha'] = hparams_dict['alpha'] * (t_step + 1 / t_step)
-    update_dibs_hparams['beta'] = hparams_dict['beta'] * (t_step + 1 / t_step)
+    update_dibs_hparams['alpha'] = hparams_dict['alpha'] * factor
+    update_dibs_hparams['beta'] = hparams_dict['beta'] * factor
     return update_dibs_hparams
 
 
-def update_dibs_hparams_old(hparams_dict, t_step):
-    """
-    Updates hyperparameters that anneal with time step t_step.
-    Modifies hparams_dict in place or returns a new one.
-    JAX version returns a new dict.
-    """
-    # Ensure t_step is not zero to avoid division by zero if using (t + 1/t)
-    # The JAX SVGD loop adds 1 to t before passing to update_dibs_hparams.
-    # So, t_step here corresponds to (actual_iteration + 1).
-    
-    # Make a copy to avoid modifying the original config dict if it's reused.
-    updated_hparams = hparams_dict.copy()
 
-    # Original JAX annealing: factor = (t + 1/t)
-    # This factor decreases then increases. For annealing, we usually want monotonic increase/decrease.
-    # Example: linear annealing or exponential decay/increase.
-    # If t_step is iter_num + 1:
-    factor = 1.0 # Default, no annealing
-    if t_step > 0: # Basic check
-        # A common annealing schedule is to increase beta, tau, alpha over time.
-        # Let's use a simple linear increase for demonstration, or keep JAX's if intended.
-        # factor = t_step / total_steps (for linear increase from 0 to 1)
-        # factor = initial_value * decay_rate ** t_step (for exponential)
-        # The JAX code uses `hparams["param"] * (t + 1 / t)` which is unusual for typical annealing.
-        # It might be specific to their empirical findings or a typo.
-        # If t is large, (t + 1/t) approx t.
-        # If t is small (e.g., 1), factor is 2. If t=0.5, factor is 2.5. If t=0.1, factor is 10.1.
-        # This suggests t should be > 0 and perhaps not too small.
-        # Given the SVGD loop sets t = iteration_number + 1, t_step >= 1.
-        # For t_step=1, factor=2. For t_step=2, factor=2.5. For t_step=10, factor=10.1.
-        # This is an increasing factor.
-        if t_step == 0: # Should not happen if t = iter + 1
-            factor = 1.0 # Or some initial large value if it's 1/t like
-        else:
-            factor = t_step + (1.0 / t_step)
-            # To prevent excessive amplification at early stages if base values are large:
-            # factor = min(factor, some_cap_if_needed) 
-            # Or simply ensure base tau/alpha/beta are small.
-            # The JAX code directly multiplies: `hparams["tau"] * (t + 1 / t)`
-            # This means the base hparams['tau'] should be the value at factor=1.
-            # The JAX code in `update_dibs_hparams` was:
-            # updated_hparams["tau"] = hparams["tau"] # No annealing in provided snippet, but paper implies it
-            # updated_hparams["alpha"] = hparams["alpha"] * (t + 1 / t)
-            # updated_hparams["beta"] = hparams["beta"] * (t + 1 / t)
-            # Let's follow this for alpha and beta. Tau is often annealed too.
-            # The paper mentions annealing alpha and beta to infinity, and tau for Gumbel-softmax.
-
-    # Assuming base hparams are for t=0 or some reference point.
-    # If hparams already contains the annealed value, this logic is wrong.
-    # The JAX `update_dibs_hparams` seems to take the *base* hparams and current t.
-    
-    # Let's assume hparams_dict contains the *base* values.
-    if 'tau_base' in hparams_dict: # Example: if we want to anneal tau
-        updated_hparams["tau"] = hparams_dict.get("tau_base", 1.0) * factor
-    else: # If 'tau' is already the value to be used or not annealed by this factor
-        updated_hparams["tau"] = hparams_dict.get("tau", 1.0) # Default if not present
-
-    if 'alpha_base' in hparams_dict:
-        updated_hparams["alpha"] = hparams_dict["alpha_base"] * factor
-    elif 'alpha' in hparams_dict: # If alpha itself is the base to be multiplied
-         updated_hparams["alpha"] = hparams_dict["alpha"] * factor
-
-
-    if 'beta_base' in hparams_dict:
-        updated_hparams["beta"] = hparams_dict["beta_base"] * factor
-    elif 'beta' in hparams_dict:
-        updated_hparams["beta"] = hparams_dict["beta"] * factor
-        
-    return updated_hparams
 
 
 def hard_gmat_particles_from_z(z_particles, alpha_hparam_for_scores=1.0):

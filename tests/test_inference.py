@@ -249,9 +249,10 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
             Z_current.add_(lr_z * grad_z)
             Theta_current.add_(lr_theta * grad_theta)
 
-        if (t_iter + 1) % 10 == 0 or t_iter == 0 or (t_iter + 1) == num_iterations :
+        if (t_iter + 1) % 50 == 0 or t_iter == 0 or (t_iter + 1) == num_iterations :
             log.info(f"Iter {t_iter+1:3d}: Z_norm={Z_current.norm().item():.4f}, Theta_norm={Theta_current.norm().item():.4f}, "
                   f"log_joint={lj_val:.4f}, grad_Z_norm={grad_z_norm:.4e}, grad_Theta_norm={grad_theta_norm:.4e}")
+            log.info(f"    grad_Theta (sample from iter {t_iter+1}):\n{grad_theta.round(decimals=4)}")
 
             current_hparams_for_iter = update_dibs_hparams(base_hparams_config, current_annealing_t_for_hparams.item()) #
             log.info(f"    Annealed: alpha={current_hparams_for_iter['alpha']:.3f}, beta={current_hparams_for_iter['beta']:.3f}, tau={current_hparams_for_iter['tau']:.3f}")
@@ -272,6 +273,7 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
     log.info("\n--- Single Particle Gradient Ascent (X1->X2->X3 Data with Hydra) Completed ---")
     log.info(f"Final Z (norm): {Z_current.norm().item():.4f}")
     log.info(f"Final Theta (norm): {Theta_current.norm().item():.4f}")
+    log.info(f"Final Theta:\n{Theta_current.round(decimals=4)}")
 
     # Comparison with Ground Truth
     final_t_for_hparams = torch.tensor(float(num_iterations))
@@ -287,8 +289,15 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
     except Exception as e:
         log.error(f"Could not generate final hard graph from Z_current: {e}. Using zeros for G_learned_hard.")
 
+
     log.info("\n--- Comparison with Ground Truth ---")
     # ... (your comparison print statements from test_inference.py) ...
+
+    ## print the final graph * theta 
+    G_learned_hard = hard_gmat_particles_from_z(Z_current.unsqueeze(0), alpha_hparam_for_scores=final_hparams['alpha']).squeeze(0).int()
+    log.info(f"Final G_learned_hard:\n{G_learned_hard}")
+    log.info(f"Final G_learned_hard * Theta_true:\n{G_learned_hard * Theta_current}")
+
 
 
 if __name__ == '__main__':

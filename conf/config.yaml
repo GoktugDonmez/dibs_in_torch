@@ -31,7 +31,7 @@ seed: 100 # This can be a global seed
 data:
   d_nodes: 3
   num_samples: 500
-  synthetic_obs_noise_std: 0.01
+  synthetic_obs_noise_std: 0.1
   ground_truth_seed: 100 # from data_package generation in test_inference.py
 
 # Particle initialization
@@ -57,7 +57,7 @@ model_hparams:
 training:
   lr_z: 0.005
   lr_theta: 0.005
-  num_iterations: 1 # Default from your test script
+  num_iterations: 100
   max_grad_norm_z: 11.0
   max_grad_norm_theta: 19.0
   # Annealing step will be managed by the iteration loop
