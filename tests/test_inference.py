@@ -296,6 +296,7 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
     ## print the final graph * theta 
     G_learned_hard = hard_gmat_particles_from_z(Z_current.unsqueeze(0), alpha_hparam_for_scores=final_hparams['alpha']).squeeze(0).int()
     log.info(f"Final G_learned_hard:\n{G_learned_hard}")
+    log.info(f"{50*'*'}")
     log.info(f"Final G_learned_hard * Theta_true:\n{G_learned_hard * Theta_current}")
 
 
