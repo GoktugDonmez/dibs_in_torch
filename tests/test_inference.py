@@ -235,9 +235,9 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
             grad_theta = grads['theta']
 
             if max_grad_norm_z > 0: # Check if clipping is enabled
-                torch.nn.utils.clip_grad_norm_(grad_z, max_grad_norm_z)
+                torch.nn.utils.clip_grad_norm_([Z_param, Theta_param],max_norm=max_grad_norm_z)  # or θ
             if max_grad_norm_theta > 0: # Check if clipping is enabled
-                torch.nn.utils.clip_grad_norm_(grad_theta, max_grad_norm_theta)
+                torch.nn.utils.clip_grad_norm_([Z_param, Theta_param],max_norm=max_grad_norm_z)  # or θ
             
             grad_z_norm = grad_z.norm().item()
             grad_theta_norm = grad_theta.norm().item()

@@ -330,38 +330,31 @@ def bernoulli_soft_gmat(z, hparams):
     sampled_gmat = torch.bernoulli(probabilities)
     return sampled_gmat
 
-
-def gumbel_soft_gmat_old(z, hparams, device='cpu'):
-    """
-    Generates a soft adjacency matrix using Gumbel-Sigmoid reparameterization.
-    G_ij = sigmoid(tau * (logistic_noise_ij + alpha * u_i^T v_j))
-    z: latent variables [D, K, 2] (for a single particle)
-    hparams: dictionary containing 'alpha', 'tau'
-    Returns: soft_gmat [D, D] (differentiable soft samples)
-    """
-    d = z.shape[0]
-    raw_scores = scores(z, hparams['alpha']) # [D, D]
-
-    # Sample Logistic noise L_ij ~ Logistic(0,1)
-    # PyTorch's Logistic distribution is location=0, scale=1 by default
-    logistic_dist = Logistic(torch.tensor([0.0], device=device), torch.tensor([1.0], device=device))
-    # JAX uses jax.random.logistic(key, shape=(d,d)).
-    # PyTorch equivalent:
-    # Standard logistic U(0,1) -> log(U) - log(1-U)
-    # Or use logistic_dist.sample((d,d)).squeeze(-1) if it adds extra dim
-    logistic_noise = logistic_dist.sample((d, d)).squeeze(-1)
-
-    # Gumbel-Sigmoid
-    # The JAX code uses `(_l[i,j] + score) * tau`.
-    # Here, _l is logistic noise.
-    gumbel_input = logistic_noise + raw_scores # JAX version adds score to logistic noise
-    soft_gmat = torch.sigmoid(hparams['tau'] * gumbel_input)
-
-    # Mask diagonal
-    diag_mask = 1.0 - torch.eye(d, device=device, dtype=z.dtype)
-    return soft_gmat * diag_mask
-
 def gumbel_soft_gmat(z, hparams, device=None):
+    """
+    Works for z shape [..., D, K, 2]  (any number of leading batch dims).
+    """
+    device  = z.device if device is None else device
+    *batch, d, _, _ = z.shape
+
+    # raw scores: [..., D, D]
+    raw = scores(z, hparams['alpha'])
+
+    # logistic noise, same shape as raw
+    u   = torch.rand(*batch, d, d, device=device, dtype=z.dtype)
+    noise = torch.log(u) - torch.log1p(-u)
+
+    soft = torch.sigmoid((noise + raw) * hparams['tau'])
+
+    diag = 1. - torch.eye(d, device=device, dtype=z.dtype)
+    if batch:
+        diag = diag.expand(*batch, d, d)
+    return soft * diag
+
+
+
+
+def gumbel_soft_gmat_v0(z, hparams, device=None):
     if device is None:
         device = z.device
     
@@ -495,19 +488,12 @@ def log_theta_prior(theta_effective, theta_prior_mean, theta_prior_sigma):
     return log_gaussian_likelihood(theta_effective, theta_prior_mean, sigma=theta_prior_sigma)
 
 
-# For acyclicity constraint, we need gumbel_soft_gmat and acyclic_constr
-# The JAX code has `gumbel_acyclic_constr_mc` which vmaps `acyclic_constr(jax.random.bernoulli(k, soft_gmat), d)`
-# or `gumbel_acyclic_constr_mc` which vmaps `acyclic_constr(soft_gmat(k), d)`
-# Let's implement the version that takes soft_gmat samples.
+
 
 def gumbel_acyclic_constr_mc(z_particle, d, hparams, n_mc_samples, device='cpu'):
     """
-    Monte Carlo estimate of E_{G_soft ~ p(G_soft|Z)} [h(G_soft)] using Gumbel-soft samples.
-    Or, if h(G) is defined on hard graphs, E_{G_hard ~ Bernoulli(G_soft)} [h(G_hard)].
-    The JAX `gumbel_acyclic_constr_mc` uses `acyclic_constr(soft_gmat(k), d)`.
-    The JAX `acyclic_constr_mc` uses `acyclic_constr(jax.random.bernoulli(k, bernoulli_soft_gmat(z,d,hparams)), d)`.
-    Let's assume the one for `log_joint` which is `gumbel_acyclic_constr_mc` in JAX,
-    meaning we average h(G_soft) where G_soft are Gumbel samples.
+    IT Should take hard graphs for h 
+        Or, if h(G) is defined on hard graphs, E_{G_hard ~ Bernoulli(G_soft)} [h(G_hard)].
     z_particle: single Z particle [D, K, 2]
     d: number of nodes
     hparams: hyperparameters
@@ -515,15 +501,10 @@ def gumbel_acyclic_constr_mc(z_particle, d, hparams, n_mc_samples, device='cpu')
     """
     h_samples = []
     for _ in range(n_mc_samples):
-        # Each Gumbel sample needs a fresh noise sample L, but z is fixed for this expectation.
-        # The JAX `gumbel_soft_gmat(k, z, ...)` takes a key `k` for randomness.
-        # Here, we generate noise inside gumbel_soft_gmat.
         g_soft = gumbel_soft_gmat(z_particle, hparams, device=device)
         
-        # TODO WHICH IS CORRECT
-        #  we should give hard gmat to get h values?
+        #  we should give hard gmat to get h values
         h_samples.append(acyclic_constr(torch.bernoulli(g_soft), d))
-        
         # h_samples.append(acyclic_constr(g_soft, d))
     
 
@@ -862,6 +843,9 @@ def update_dibs_hparams(hparams_dict, t_step):
     update_dibs_hparams = hparams_dict.copy()
     t = max(float(t_step), 1.0e-3)
     factor = t + 1.0 / t
+    #warm_up  = 10.0
+    #factor   = (t / warm_up).clamp(min=0., max=1.) + (warm_up / t).clamp(max=1.)
+
 
     update_dibs_hparams['tau'] = hparams_dict['tau']
     update_dibs_hparams['alpha'] = hparams_dict['alpha'] * factor
