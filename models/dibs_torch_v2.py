@@ -309,6 +309,15 @@ def scores(z, alpha_hparam):
 
 
 def bernoulli_soft_gmat(z, hparams):
+    """Return P(edge_ij = 1 | z).  Shape [..., D, D], values in (0,1)."""
+    return torch.sigmoid(scores(z, hparams["alpha"]))
+
+def bernoulli_sample_gmat(z, hparams):
+    """Sample a hard graph using the above probabilities."""
+    probs = bernoulli_soft_gmat(z, hparams)
+    return torch.bernoulli(probs)
+
+def bernoulli_soft_gmat_old_wrong(z, hparams):
     """
     Generates a *sampled* binary adjacency matrix G by first computing probabilities
     P_ij = sigmoid(alpha * u_i^T v_j) and then sampling G_ij ~ Bernoulli(P_ij).
@@ -682,8 +691,11 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
         # TODO look at the expectectation for mc (Original comment, relevant to g_soft generation strategy)
         g_soft_from_fixed_z = bernoulli_soft_gmat(current_z_nonopt, hparams_full) 
         
-        # As per existing comments, assume the soft bernoulli matrix is used directly for G.
-        g_soft_for_lik = g_soft_from_fixed_z 
+        
+        # TRY WITH sampling g   
+        #g_soft_for_lik = g_soft_from_fixed_z 
+        g_soft_for_lik = torch.bernoulli(g_soft_from_fixed_z)
+        ## IMPORTANT TODO THIS IS NOT SOFT CHANGE THE NAME 
 
         log_lik_val = log_full_likelihood(data_dict, g_soft_for_lik, current_theta_opt, hparams_full, device=device)
         
@@ -847,8 +859,8 @@ def update_dibs_hparams(hparams_dict, t_step):
     #factor   = (t / warm_up).clamp(min=0., max=1.) + (warm_up / t).clamp(max=1.)
 
 
-    update_dibs_hparams['tau'] = hparams_dict['tau']
-    update_dibs_hparams['alpha'] = hparams_dict['alpha'] * factor
+    #update_dibs_hparams['tau'] = hparams_dict['tau']
+    #update_dibs_hparams['alpha'] = hparams_dict['alpha'] * factor
     update_dibs_hparams['beta'] = hparams_dict['beta'] * factor
     return update_dibs_hparams
 
