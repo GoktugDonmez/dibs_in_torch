@@ -1,5 +1,5 @@
 0 . Purpose & high-level picture
-This repo is an experimental PyTorch re-implementation of DiBS (Disentangled Bayesian Structure scores) for differentiable Bayesian causal discovery.
+This repo is an experimental PyTorch re-implementation of DiBS: Differentiable Bayesian Structure Learning for differentiable Bayesian causal discovery.
 The JAX reference code (~4 k LOC, mixed model + inference) is flattened here into two Python files so it is easier to iterate, debug, and eventually grow into a modular library:
 
 file	role	key objects / functions
