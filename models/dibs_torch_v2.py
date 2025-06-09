@@ -237,7 +237,7 @@ def log_gaussian_likelihood(x, pred_mean, sigma=0.1):
     if isinstance(sigma, (float, int)):
         sigma = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
     
-    sigma = torch.clamp(sigma, min=1e-6, max=1e3)  # Prevent extreme values
+    sigma = torch.clamp(sigma, min=1e-12, max=1e5)  # Prevent extreme values
     
     # Compute residuals
     residuals = x - pred_mean
@@ -309,35 +309,22 @@ def scores(z, alpha_hparam):
 
 
 def bernoulli_soft_gmat(z, hparams):
-    """Return P(edge_ij = 1 | z).  Shape [..., D, D], values in (0,1)."""
-    return torch.sigmoid(scores(z, hparams["alpha"]))
+    #"""Return P(edge_ij = 1 | z).  Shape [..., D, D], values in (0,1)."""
+    #return torch.sigmoid(scores(z, hparams["alpha"]))
+    # Add the mask
+    """Return ``P(edge_ij = 1 | z)`` with zero diagonal."""
+    probs = torch.sigmoid(scores(z, hparams["alpha"]))
+    d = probs.shape[-1]
+    diag_mask = 1.0 - torch.eye(d, device=probs.device, dtype=probs.dtype)
+    if probs.ndim == 3:
+        diag_mask = diag_mask.expand(probs.shape[0], d, d)
+    return probs * diag_mask
 
 def bernoulli_sample_gmat(z, hparams):
     """Sample a hard graph using the above probabilities."""
     probs = bernoulli_soft_gmat(z, hparams)
     return torch.bernoulli(probs)
 
-def bernoulli_soft_gmat_old_wrong(z, hparams):
-    """
-    Generates a *sampled* binary adjacency matrix G by first computing probabilities
-    P_ij = sigmoid(alpha * u_i^T v_j) and then sampling G_ij ~ Bernoulli(P_ij).
-    The scores u_i^T v_j are for P(i->j).
-    Diagonal elements are implicitly zero due to how scores() masks the diagonal.
-
-    z: latent variables [N_particles, D, K, 2] or [D, K, 2]
-    hparams: dictionary containing 'alpha'
-    Returns: sampled_gmat [N_particles, D, D] or [D,D] (binary 0/1 matrix)
-    """
-    # scores(z, hparams['alpha']) returns S_ij where S_ij is score for i->j, with diagonal masked.
-    raw_scores = scores(z, hparams['alpha']) 
-    
-    # probabilities_ij = sigmoid(score for i->j)
-    probabilities = torch.sigmoid(raw_scores) 
-    
-    # sampled_gmat_ij ~ Bernoulli(probabilities_ij)
-    # This is a binary matrix (0.0 or 1.0)
-    sampled_gmat = torch.bernoulli(probabilities)
-    return sampled_gmat
 
 def gumbel_soft_gmat(z, hparams, device=None):
     """
