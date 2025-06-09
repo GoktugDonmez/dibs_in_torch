@@ -29,10 +29,19 @@ seed: 100 # This can be a global seed
 
 # Data generation parameters
 data:
-  d_nodes: 3
+  d_nodes: 3  # or 5, 10, etc.
   num_samples: 500
   synthetic_obs_noise_std: 0.1
-  ground_truth_seed: 100 # from data_package generation in test_inference.py
+  ground_truth_seed: 42
+  
+  # New graph configuration
+  graph_type: "chain"  # Options: "chain", "erdos_renyi", "scale_free"
+  
+  # Erdős-Rényi specific parameters
+  p_edge: 0.3
+  
+  # Scale-free specific parameters  
+  m: 2
 
 # Particle initialization
 particle:

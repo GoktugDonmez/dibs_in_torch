@@ -24,6 +24,8 @@ from models.dibs_torch_v2 import (
     grad_z_log_joint_gumbel, grad_theta_log_joint,
     update_dibs_hparams, scores, acyclic_constr
 )
+from models.graph_priors import generate_ground_truth_data_with_graph_prior
+
 # Placeholder for utils if needed, e.g., create_dummy_z, create_dummy_theta
 # from models.utils_torch import sample_x # If used
 
@@ -171,11 +173,24 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
     if cfg.seed is not None:
         torch.manual_seed(cfg.seed)
 
-    data_package = generate_ground_truth_data_x1_x2_x3( # Assuming this function is defined above
+    # Configuration for graph type and parameters
+    graph_type = cfg.data.get("graph_type", "chain")  # Default to chain for backward compatibility
+    graph_params = {}
+    
+    if graph_type == "erdos_renyi":
+        graph_params["p_edge"] = cfg.data.get("p_edge", 0.3)
+    elif graph_type == "scale_free":
+        graph_params["m"] = cfg.data.get("m", 2)
+    
+    data_package = generate_ground_truth_data_with_graph_prior(
+        graph_type=graph_type,
+        d=D_nodes,
         num_samples=N_samples_data,
         obs_noise_std=synthetic_obs_noise_std,
+        graph_params=graph_params,
         seed=ground_truth_seed
     )
+    
     data_dict = {'x': data_package['x'], 'y': data_package['y']}
     G_true = data_package['G_true']
     Theta_true = data_package['Theta_true']
@@ -291,14 +306,88 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
 
 
     log.info("\n--- Comparison with Ground Truth ---")
-    # ... (your comparison print statements from test_inference.py) ...
-
-    ## print the final graph * theta 
-    G_learned_hard = hard_gmat_particles_from_z(Z_current.unsqueeze(0), alpha_hparam_for_scores=final_hparams['alpha']).squeeze(0).int()
-    log.info(f"Final G_learned_hard:\n{G_learned_hard}")
-    log.info(f"{50*'*'}")
-    log.info(f"Final G_learned_hard * Theta_true:\n{G_learned_hard * Theta_current}")
-
+    log.info("\n" + "="*60)
+    log.info("FINAL RESULTS COMPARISON")
+    log.info("="*60)
+    
+    # 1. Ground Truth
+    log.info("\n1. GROUND TRUTH:")
+    log.info(f"   G_true (adjacency matrix):\n{G_true.int()}")
+    log.info(f"   Theta_true (edge weights):\n{Theta_true.round(decimals=3)}")
+    log.info(f"   Theta_true * G_true (masked weights):\n{(Theta_true * G_true).round(decimals=3)}")
+    
+    # 2. Learned Parameters
+    log.info("\n2. LEARNED PARAMETERS:")
+    log.info(f"   Final Z (norm): {Z_current.norm().item():.4f}")
+    log.info(f"   Final Theta (norm): {Theta_current.norm().item():.4f}")
+    log.info(f"   Theta_learned (raw):\n{Theta_current.round(decimals=3)}")
+    
+    # 3. Soft Edge Probabilities
+    final_t_for_hparams = torch.tensor(float(num_iterations))
+    final_hparams = update_dibs_hparams(base_hparams_config, final_t_for_hparams.item())
+    
+    hparams_for_edge_probs = {'alpha': final_hparams['alpha'], 'd': D_nodes}
+    with torch.no_grad():
+        soft_edge_probs = bernoulli_soft_gmat(Z_current, hparams_for_edge_probs)
+    
+    log.info("\n3. SOFT EDGE PROBABILITIES:")
+    log.info(f"   Edge probabilities (from Z):\n{soft_edge_probs.round(decimals=3)}")
+    
+    # 4. Hard Graph Recovery
+    try:
+        G_learned_hard = hard_gmat_particles_from_z(
+            Z_current.unsqueeze(0), 
+            alpha_hparam_for_scores=final_hparams['alpha']
+        ).squeeze(0).int()
+    except Exception as e:
+        log.error(f"Error generating hard graph: {e}")
+        G_learned_hard = torch.zeros_like(G_true, dtype=torch.int32)
+    
+    log.info("\n4. HARD GRAPH RECOVERY:")
+    log.info(f"   G_learned_hard:\n{G_learned_hard}")
+    log.info(f"   Theta_learned * G_learned_hard:\n{(Theta_current * G_learned_hard).round(decimals=3)}")
+    
+    # 5. Structure Recovery Metrics
+    log.info("\n5. STRUCTURE RECOVERY METRICS:")
+    
+    # True positives, false positives, etc.
+    G_true_bool = G_true.bool()
+    G_learned_bool = G_learned_hard.bool()
+    
+    true_positives = (G_true_bool & G_learned_bool).sum().item()
+    false_positives = (~G_true_bool & G_learned_bool).sum().item()
+    false_negatives = (G_true_bool & ~G_learned_bool).sum().item()
+    true_negatives = (~G_true_bool & ~G_learned_bool).sum().item()
+    
+    total_edges = D_nodes * (D_nodes - 1)  # Exclude diagonal
+    accuracy = (true_positives + true_negatives) / total_edges
+    
+    log.info(f"   True edges in ground truth: {G_true_bool.sum().item()}")
+    log.info(f"   True edges in learned graph: {G_learned_bool.sum().item()}")
+    log.info(f"   True positives: {true_positives}")
+    log.info(f"   False positives: {false_positives}")
+    log.info(f"   False negatives: {false_negatives}")
+    log.info(f"   Structural accuracy: {accuracy:.3f}")
+    
+    # 6. Weight Recovery (for correctly identified edges)
+    if true_positives > 0:
+        correct_edges = G_true_bool & G_learned_bool
+        true_weights = Theta_true[correct_edges]
+        learned_weights = Theta_current[correct_edges]
+        
+        weight_mse = ((true_weights - learned_weights) ** 2).mean().item()
+        weight_mae = (true_weights - learned_weights).abs().mean().item()
+        
+        log.info("\n6. WEIGHT RECOVERY (for correctly identified edges):")
+        log.info(f"   Weight MSE: {weight_mse:.4f}")
+        log.info(f"   Weight MAE: {weight_mae:.4f}")
+        log.info(f"   True weights: {true_weights.round(decimals=3).tolist()}")
+        log.info(f"   Learned weights: {learned_weights.round(decimals=3).tolist()}")
+    else:
+        log.info("\n6. WEIGHT RECOVERY: No correctly identified edges!")
+    
+    log.info("\n" + "="*60)
+    log.info("\n--- End of Experiment Log ---")
 
 
 if __name__ == '__main__':
