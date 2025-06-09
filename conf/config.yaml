@@ -67,8 +67,8 @@ training:
   lr_z: 0.005
   lr_theta: 0.005
   num_iterations: 2000
-  max_grad_norm_z: 11.0
-  max_grad_norm_theta: 19.0
+  max_grad_norm_z: 110.0
+  max_grad_norm_theta: 190.0
   # Annealing step will be managed by the iteration loop
 
 # Default device

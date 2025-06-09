@@ -261,7 +261,7 @@ def log_gaussian_likelihood(x, pred_mean, sigma=0.1):
     return torch.sum(log_prob_per_point) / x.shape[0]          # average
 
 def log_bernoulli_likelihood(y_expert_edge, soft_gmat_entry, rho, jitter=1e-5):
-    """
+    """/
     Log likelihood for a single expert edge belief.
     y_expert_edge: scalar tensor, 0 or 1, expert's belief about edge presence.
     soft_gmat_entry: scalar tensor, probability of edge from soft_gmat.
@@ -522,7 +522,7 @@ def gumbel_grad_acyclic_constr_mc(z_particle_opt, d, hparams_dict_nonopt, n_mc_s
     """
     # This function computes the gradient of E_L[h(G_soft(Z,L))] w.r.t Z.
     # = E_L[grad_Z h(G_soft(Z,L))]
-    # We need to sample L, compute G_soft, compute h(G_soft), then get grad_Z h(G_soft).
+    # We need to sample L, compute G_soft, compute h(G_soft), then get grad_Z h(Gsoft).
     
     grad_h_samples = []
     for _ in range(n_mc_samples):
@@ -719,88 +719,57 @@ def grad_theta_log_joint(current_z_nonopt, current_theta_opt, data_dict, hparams
     return grad_avg_log_density_wrt_theta
 
 
-def grad_log_joint(params, data_dict, hparams_dict_config, device='cpu'):
+def grad_log_joint(params, data_dict, hparams_dict_config, device='cpu', **annealing_kwargs):
     """
     Computes gradients of the log joint P(Z, Theta, Data) w.r.t Z and Theta.
-    This is the main gradient function used by SVGD.
-    params: dict containing current 'z' and 'theta' tensors for one particle.
-            These tensors should have requires_grad=True.
-    data_dict: dict of data.
-    hparams_dict_config: dict of hyperparameters from config.
+    **annealing_kwargs: Additional parameters for update_dibs_hparams
     """
     # Ensure params require grad
-    hparams = update_dibs_hparams(hparams_dict_config, params["t"].item())
-
-    current_z = params['z'] # Should be [D, K, 2] for a single particle
-    current_theta = params['theta'] # Should be [D, D] for a single particle
+    current_z = params['z']
+    current_theta = params['theta']
     
-    # It's crucial that current_z and current_theta are the actual parameters
-    # from the optimizer, or that gradients can flow back to them.
-    # If they are detached copies, set requires_grad=True.
     if not current_z.requires_grad:
         current_z.requires_grad_(True)
     if not current_theta.requires_grad:
         current_theta.requires_grad_(True)
 
-    t_anneal = params.get('t', torch.tensor([0.0], device=device)).item() # Annealing step
-    # JAX uses params['t'].reshape(-1)[0].astype(int)
-    # Ensure t_anneal is an int or float suitable for hparam update
-    # The JAX code adds 1 to t in the loop before passing to update_dibs_hparams
+    t_anneal = params.get('t', torch.tensor([0.0], device=device)).item()
     
-    # Create a mutable copy for hparams to be updated
-    hparams_updated_for_step = hparams_dict_config.copy() # Shallow copy
-    # If hparams_dict_config contains nested dicts, deepcopy might be safer if they are modified.
-    # For DiBS, update_dibs_hparams modifies top-level keys.
-    hparams_updated_for_step = update_dibs_hparams(hparams_updated_for_step, t_anneal)
-
-
-    # Combine current params (like theta if needed by grad_z, or z if needed by grad_theta)
-    # with hparams_updated_for_step for the `nonopt_params` or `hparams_full` arguments.
-    # JAX uses `params | hparams` which merges dicts.
-    hparams_and_current_params = {**hparams_updated_for_step, **params} # Python 3.5+
-    # Or:
-    # hparams_and_current_params = hparams_updated_for_step.copy()
-    # hparams_and_current_params.update(params)
-
-
-    # angelo_fortuin_anneal = 1.0 # As in JAX code for now
+    # Update hparams with annealing - pass through kwargs
+    hparams = update_dibs_hparams(hparams_dict_config, t_anneal, **annealing_kwargs)
 
     # Compute grad_z
-    # For grad_z_log_joint_gumbel, current_theta is non-optimal (fixed)
     grad_z = grad_z_log_joint_gumbel(
         current_z_opt=current_z,
-        current_theta_nonopt=current_theta.detach(), # Treat theta as fixed for dZ
+        current_theta_nonopt=current_theta.detach(),
         data_dict=data_dict,
-        hparams_full=hparams, # Pass merged params
+        hparams_full=hparams,
         device=device
     )
     
     # Compute grad_theta
-    # For grad_theta_log_joint, current_z is non-optimal (fixed)
     grad_theta = grad_theta_log_joint(
-        current_z_nonopt=current_z.detach(), # Treat z as fixed for dTheta
+        current_z_nonopt=current_z.detach(),
         current_theta_opt=current_theta,
         data_dict=data_dict,
-        hparams_full=hparams, # Pass merged params
+        hparams_full=hparams,
         device=device
     )
     
-    # The 't' parameter in JAX is a dummy for annealing, its gradient is 0.
     return {"z": grad_z, "theta": grad_theta, "t": torch.tensor([0.0], device=device)}
 
 
-def log_joint(params, data_dict, hparams_dict_config, device='cpu'):
+def log_joint(params, data_dict, hparams_dict_config, device='cpu', **annealing_kwargs):
     """
     Computes the log joint density log P(Z, Theta, Data).
-    params: dict containing 'z' and 'theta' for one particle.
-    data_dict: Data.
-    hparams_dict_config: Hyperparameters.
+    **annealing_kwargs: Additional parameters for update_dibs_hparams
     """
     current_z = params['z']
     current_theta = params['theta']
     t_anneal = params.get('t', torch.tensor([0.0], device=device)).item()
 
-    hparams_updated = update_dibs_hparams(hparams_dict_config.copy(), t_anneal)
+    # Update hparams with annealing - pass through kwargs
+    hparams_updated = update_dibs_hparams(hparams_dict_config.copy(), t_anneal, **annealing_kwargs)
     
     d = current_z.shape[0] # Assuming z is [D, K, 2]
 
@@ -838,18 +807,57 @@ def log_joint(params, data_dict, hparams_dict_config, device='cpu'):
     return log_lik + total_log_prior
 
 
-def update_dibs_hparams(hparams_dict, t_step):
-    update_dibs_hparams = hparams_dict.copy()
-    t = max(float(t_step), 1.0e-3)
-    factor = t + 1.0 / t
-    #warm_up  = 10.0
-    #factor   = (t / warm_up).clamp(min=0., max=1.) + (warm_up / t).clamp(max=1.)
 
+def update_dibs_hparams(
+    hparams_dict: dict,
+    t_step: int | float,
+    *,
+    # ---- schedule knobs you can tune from Hydra ---------------------------
+    alpha_final: float = 5.0,      # target α after the warm-up
+    alpha_warmup: int  = 500,      # iterations over which α grows
+    beta_final:  float = 50.0,     # target β
+    beta_delay:  int   = 250,      # keep β frozen for the first β_delay iters
+    beta_ramp:   int   = 750,      # length of the β linear ramp
+    tau_final:   float | None = None,  # optional τ cooling
+) -> dict:
+    """
+    Anneal α *early* (soft-edges → hard) and β *later* (loose → strict DAG),
+    as recommended in DiBS §3.3 / Alg. 1.
 
-    #update_dibs_hparams['tau'] = hparams_dict['tau']
-    #update_dibs_hparams['alpha'] = hparams_dict['alpha'] * factor
-    update_dibs_hparams['beta'] = hparams_dict['beta'] * factor
-    return update_dibs_hparams
+    • α grows **linearly** from its initial value to `alpha_final`
+      over `alpha_warmup` iterations.
+
+    • β stays constant until `beta_delay`, then grows linearly to
+      `beta_final` over `beta_ramp` iterations.
+
+    • τ can be cooled in the same fashion if `tau_final` is given.
+    """
+    hp = hparams_dict.copy()          # do **not** mutate the original dict
+    t  = float(t_step)
+
+    # -------- α schedule ---------------------------------------------------
+    #   α_t = α_0  +  (α* − α_0) · clip(t / warmup, 0, 1)
+    alpha0 = hparams_dict["alpha"]
+    alpha_progress = min(max(t / alpha_warmup, 0.0), 1.0)
+    hp["alpha"] = alpha0 + (alpha_final - alpha0) * alpha_progress
+
+    # -------- β schedule ---------------------------------------------------
+    #   β_t = β_0  (t < delay)
+    #       = β_0  +  (β* − β_0) · clip((t-delay) / ramp, 0, 1)
+    beta0 = hparams_dict["beta"]
+    if t < beta_delay:
+        hp["beta"] = beta0
+    else:
+        beta_progress = min(max((t - beta_delay) / beta_ramp, 0.0), 1.0)
+        hp["beta"] = beta0 + (beta_final - beta0) * beta_progress
+
+    # -------- optional τ cooling ------------------------------------------
+    if tau_final is not None:
+        tau0 = hparams_dict["tau"]
+        # cool τ on the *same* timeline as α so gradients do not vanish too soon
+        hp["tau"] = tau0 + (tau_final - tau0) * alpha_progress
+
+    return hp
 
 
 

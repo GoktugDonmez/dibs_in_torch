@@ -269,7 +269,16 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
                   f"log_joint={lj_val:.4f}, grad_Z_norm={grad_z_norm:.4e}, grad_Theta_norm={grad_theta_norm:.4e}")
             log.info(f"    grad_Theta (sample from iter {t_iter+1}):\n{grad_theta.round(decimals=4)}")
 
-            current_hparams_for_iter = update_dibs_hparams(base_hparams_config, current_annealing_t_for_hparams.item()) #
+            current_hparams_for_iter = update_dibs_hparams(
+                base_hparams_config, 
+                current_annealing_t_for_hparams.item(),
+                alpha_final=cfg.model_hparams.get("alpha_final", 5.0),
+                alpha_warmup=cfg.model_hparams.get("alpha_warmup", 500),
+                beta_final=cfg.model_hparams.get("beta_final", 50.0),
+                beta_delay=cfg.model_hparams.get("beta_delay", 250),
+                beta_ramp=cfg.model_hparams.get("beta_ramp", 750),
+                tau_final=cfg.model_hparams.get("tau_final", None)
+            )
             log.info(f"    Annealed: alpha={current_hparams_for_iter['alpha']:.3f}, beta={current_hparams_for_iter['beta']:.3f}, tau={current_hparams_for_iter['tau']:.3f}")
             
             hparams_for_edge_probs = {'alpha': current_hparams_for_iter['alpha'], 'd': D_nodes}
@@ -292,7 +301,16 @@ def run_gradient_ascent_experiment(cfg: DictConfig) -> None:
 
     # Comparison with Ground Truth
     final_t_for_hparams = torch.tensor(float(num_iterations))
-    final_hparams = update_dibs_hparams(base_hparams_config, final_t_for_hparams.item()) #
+    final_hparams = update_dibs_hparams(
+        base_hparams_config, 
+        final_t_for_hparams.item(),
+        alpha_final=cfg.model_hparams.get("alpha_final", 5.0),
+        alpha_warmup=cfg.model_hparams.get("alpha_warmup", 500),
+        beta_final=cfg.model_hparams.get("beta_final", 50.0),
+        beta_delay=cfg.model_hparams.get("beta_delay", 250),
+        beta_ramp=cfg.model_hparams.get("beta_ramp", 750),
+        tau_final=cfg.model_hparams.get("tau_final", None)
+    )
     
     G_learned_hard = torch.zeros_like(G_true)
     try:
