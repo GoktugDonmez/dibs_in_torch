@@ -57,3 +57,51 @@ Exploding θ gradients when true coefficients are large (≈10 or ≈-5).	Loss s
 Learnt graph cyclic for some initialisations.	DAG penalty zero-grad due to torch.bernoulli in gumbel_acyclic_constr_mc (non-diff).	Use soft Gumbel matrix inside h(G) (patch below).
 trace dim-3 error beyond iter 80 (reported).	Batched graph input to acyclic_constr, but function assumed 2-D.	Add batch-aware trace (see patch).
 Hydra config noise: many unused flags / comments.	Prototype still in flux.	Cull dead keys; move defaults into conf/config.yaml; add CI that runs pytest -q.
+
+
+I have a messy code, the dibs_torch_clean is not as good as dibs_torch_v2.py(this is more accuarate)  and i dont get the same results in clean thats an issue,  the main 2 file is dibs_torch_v2.py and test_inference. i want to create a more structured code where i have defined utils, graph prior generated gorund truth (right now its the chain in test inference), the model and the test traning with a basic sgd recommend how i can structure this 
+
+
+### **Current Implementation and Experiments**
+
+- **PyTorch Implementation of DiBS:**
+    - You have an initial, operational PyTorch implementation of the DiBS (Differentiable Bayesian Structure Learning) model running simple sg ascent.
+    - This implementation is primarily designed for clarity in understanding how DiBS transitions from continuous latent spaces to discrete DAG representations.
+    - *The current setup uses a simple li*near causal graph example (x1→x2→x3x_1 \rightarrow x_2 \rightarrow x_3x1→x2→x3) to verify correctness.
+- **Code Quality and Structure:**
+    - Your current implementation is somewhat messy and could benefit from improved modularity and clarity.
+    - You plan to refine this implementation for greater flexibility and readability, facilitating more complex extensions (e.g., nonlinearities, varied priors).
+
+### **Immediate Next Steps**
+
+- **Implement Graph Priors:**
+    - Develop and integrate scale-free and Erdős-Rényi priors into existing PyTorch DiBS code.
+    - Validate correctness using synthetic DAGs.
+- **Nonlinear SCM Implementation:**
+    - Define and integrate neural-network-based SCM functions.
+    - Adapt likelihood and inference procedures accordingly.
+- **Code Cleanup and Documentation:**
+    - Restructure existing implementation for clarity and modularity.
+    - Prepare for easy future extension and experimentation.
+
+
+### **Upcoming Implementation Tasks**
+
+### **1. Incorporation of Graph Priors**
+
+You aim to introduce proper graph priors into the current DiBS implementation. Specifically, you are considering:
+
+- **Scale-Free Priors:**
+- **Erdős-Rényi Priors:**
+
+### **2. Nonlinear Extensions**
+
+- You plan to extend the DiBS model to nonlinear functional dependencies by:
+    - Using neural networks (NN) for modeling conditional distributions.
+    - Adjusting likelihood computations from linear Gaussian models to more general, nonlinear neural network-based models.
+
+This involves significant modifications to:
+
+- Likelihood computation.
+- Neural network definition and training.
+- Differentiable inference routines.
