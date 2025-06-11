@@ -9,6 +9,123 @@ import logging
 # Get a logger for this module
 log = logging.getLogger("DiBS")
 
+
+class NodeFFN(torch.nn.Module):
+    """
+    One-hidden-layer (or linear) MLP that maps a masked d-dim vector -> scalar.
+    Setting hidden=0 gives a single Linear(d,1) so it can reproduce Θ exactly.
+    """
+    def __init__(self, d: int, hidden: int = 0):
+        super().__init__()
+        if hidden > 0:
+            self.net = torch.nn.Sequential(
+                torch.nn.Linear(d, hidden),
+                torch.nn.ReLU(),
+                torch.nn.Linear(hidden, 1, bias=True)
+            )
+        else:                               # shallow == linear surrogate
+            self.net = torch.nn.Linear(d, 1, bias=True)
+
+    def forward(self, x_masked: torch.Tensor) -> torch.Tensor:
+        # x_masked : [..., d]
+        return self.net(x_masked).squeeze(-1)  # [...,]
+# ---------------------------------------------------------------------------
+def log_phi_prior(nets: torch.nn.ModuleList,
+                  sigma: float = 0.1) -> torch.Tensor:
+    """
+    Isotropic Gaussian prior over *all* weights & biases in Φ (ModuleList).
+    """
+    logp = 0.0
+    normal = Normal(0.0, sigma)
+    for net in nets:
+        for p in net.parameters():
+            logp += normal.log_prob(p).sum()
+    return logp
+# ---------------------------------------------------------------------------
+
+def log_full_likelihood_mlp(
+        data: dict,
+        soft_gmat: torch.Tensor,           # [d,d]
+        nets: torch.nn.ModuleList,         # list(NodeFFN), length d
+        hparams: dict,
+        device: str = 'cpu'
+    ) -> torch.Tensor:
+    """
+    log p(Data | Z, Φ)  where Φ is a ModuleList of per-node MLPs.
+    """
+    x_data = data['x']                                      # [N,d]
+    N, d   = x_data.shape
+    assert d == soft_gmat.shape[0] == len(nets), "dim mismatch"
+
+    # ------- compute mean column-wise with masking -------------------------
+    mu_cols = []
+    for j in range(d):
+        masked_x = x_data * soft_gmat[:, j]                 # [N,d] ⊙ [d]
+        mu_cols.append(nets[j](masked_x))                   # [N]
+    pred_mean = torch.stack(mu_cols, dim=1)                 # [N,d]
+
+    # ------- Gaussian log-lik ------------------------------------------------
+    sigma_obs = hparams.get('sigma_obs_noise', 0.1)
+    log_2pi   = torch.log(torch.tensor(2.0 * torch.pi, device=device))
+    residuals = torch.clamp(x_data - pred_mean, -1e3, 1e3)
+    log_prob_per_point = -0.5 * (
+        log_2pi + 2.0 * torch.log(torch.tensor(sigma_obs, device=device)) +
+        (residuals / sigma_obs) ** 2
+    )
+    log_obs_lik = log_prob_per_point.sum()
+
+    # ------- optional expert edge likelihood (unchanged) -------------------
+    log_expert, inv_temp = 0.0, 0.0
+    if data.get("y", None):
+        inv_temp = hparams.get("temp_ratio", 0.0)
+        rho      = hparams["rho"]
+        for i, j, val in data["y"]:
+            g_ij = soft_gmat[int(i), int(j)]
+            p1   = g_ij * (1 - rho) + (1 - g_ij) * rho
+            p0   = g_ij * rho       + (1 - g_ij) * (1 - rho)
+            log_expert += val * torch.log(p1 + 1e-8) + (1 - val) * torch.log(p0 + 1e-8)
+
+    return log_obs_lik + inv_temp * log_expert
+
+
+
+def log_joint_mlp(
+        params: dict,                     # needs 'z', 'phi', 't'
+        data_dict: dict,
+        hparams_cfg: dict,
+        device: str = 'cpu'
+    ) -> torch.Tensor:
+    """
+    log P(Z, Φ, Data)  — keeps original acyclicity machinery.
+    """
+    z     = params['z']
+    phi   = params['phi']                # ModuleList
+    t_val = params.get('t', torch.tensor(0., device=device)).item()
+
+    hparams = update_dibs_hparams(hparams_cfg.copy(), t_val)
+
+    # ---------- likelihood --------------------------------------------------
+    g_soft = bernoulli_soft_gmat(z, hparams)
+    log_lik = log_full_likelihood_mlp(data_dict, g_soft, phi, hparams, device)
+
+    # ---------- Z-priors (same as before) -----------------------------------
+    log_p_z_gauss = torch.distributions.Normal(
+        0.0, hparams['sigma_z']).log_prob(z).sum()
+    exp_h = gumbel_acyclic_constr_mc(
+        z, z.shape[0],
+        hparams,
+        hparams.get('n_nongrad_mc_samples', hparams['n_grad_mc_samples']),
+        device)
+    log_p_z_acyc = -hparams['beta'] * exp_h
+    log_p_z = log_p_z_gauss + log_p_z_acyc
+
+    # ---------- Φ prior -----------------------------------------------------
+    log_p_phi = log_phi_prior(phi, hparams.get('phi_prior_sigma', 1.0))
+
+    return log_lik + log_p_z + log_p_phi
+
+
+
 # --- Assumed utility functions (would need to be translated from models/utils.py) ---
 def acyclic_constr_old(g_mat, d):
     """

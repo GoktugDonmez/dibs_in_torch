@@ -1,0 +1,61 @@
+# conf/config_mlp.yaml - Optimized config for MLP-based DiBS
+hydra:
+  job_logging:
+    formatters:
+      ultra_short:
+        format: '[%(asctime)s][%(name).1s][%(levelname).1s] %(message)s'
+        datefmt: '%H:%M:%S'
+    handlers:
+      console:
+        formatter: ultra_short
+      file:
+        formatter: ultra_short
+
+defaults:
+  - override hydra/job_logging: default
+
+# General experiment parameters
+project_name: "dibs_torch_mlp_experiment"
+experiment_name: "x1_x2_x3_ground_truth_mlp"
+seed: 100
+
+# Data generation parameters
+data:
+  d_nodes: 3
+  num_samples: 500
+  synthetic_obs_noise_std: 0.1
+  ground_truth_seed: 100
+
+# Particle initialization
+particle:
+  k_latent: 3
+  init_seed_offset: 1
+
+# DiBS Model Hyperparameters (optimized for MLPs)
+model_hparams:
+  alpha_val: 5.0  # Much stronger edge sparsity penalty
+  beta_val: 10.0  # Much stronger acyclicity penalty  
+  tau_val: 1.0
+  sigma_z_val_divisor_for_k_latent: 1.0
+  sigma_obs_noise_val_is_data_noise: true
+  rho_val: 0.05
+  temp_ratio_val: 0.0
+  n_grad_mc_samples_val: 2  # Reduced for faster computation with MLPs
+  n_nongrad_mc_samples_val: 3  # Reduced for faster computation
+  theta_prior_sigma_val: 0.5
+  # MLP-specific parameters
+  phi_prior_sigma_val: 0.001  # Much stronger MLP weight penalty
+  hidden_dim: 0  # LINEAR MLPs - should be equivalent to linear DiBS
+
+# Training/Optimization parameters
+training:
+  lr_z: 0.01   # Increased learning rate for Z
+  lr_theta: 0.005
+  lr_phi: 0.001  # Much slower learning for MLPs
+  num_iterations: 500  # Reduced iterations for faster testing
+  max_grad_norm_z: 2.0   # Tighter gradient clipping
+  max_grad_norm_theta: 19.0
+  max_grad_norm_phi: 0.5  # Much tighter gradient clipping for MLP networks
+
+# Default device
+device: 'cpu'
